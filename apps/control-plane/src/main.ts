@@ -42,6 +42,7 @@ function loadConfig(): AppConfig {
       .split(",")
       .map((d) => d.trim())
       .filter((d) => d.length > 0),
+    apiKey: process.env.API_KEY || undefined,
   };
 }
 

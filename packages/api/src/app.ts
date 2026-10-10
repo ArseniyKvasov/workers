@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { secureHeaders } from "hono/secure-headers";
 import { logger as honoLogger } from "hono/logger";
@@ -42,6 +42,8 @@ export interface AppConfig {
   rateLimitPerMinute: number;
   rateLimitBurst: number;
   egressAllowedDomains: string[];
+  /** Static management API key from env; also accepts DB-stored keys. */
+  apiKey?: string;
 }
 
 export interface AppRepositories {
@@ -136,6 +138,50 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
     );
   });
 
+  // --- Public worker ingress (no auth): anyone can invoke a worker ---------
+  const forwardToWorker = async (c: Context<AppVariables>) => {
+    const workerName = c.req.param("name");
+    const subpath = c.req.param("0") ?? "";
+    if (!workerName) {
+      return c.json({ error: { code: "NOT_FOUND", message: "worker name is required" } }, 404);
+    }
+
+    const query: Record<string, string> = {};
+    c.req.raw.url
+      .split("?")[1]
+      ?.split("&")
+      .filter((pair) => pair.length > 0)
+      .forEach((pair) => {
+        const [key, ...rest] = pair.split("=");
+        query[decodeURIComponent(key!)] = decodeURIComponent(rest.join("="));
+      });
+
+    const headers: Record<string, string> = {};
+    c.req.raw.headers.forEach((value, key) => {
+      if (key !== "host" && key !== "connection") headers[key] = value;
+    });
+
+    const body = ["GET", "HEAD"].includes(c.req.method)
+      ? undefined
+      : Buffer.from(await c.req.raw.arrayBuffer()).toString("utf8");
+
+    const result = await workersService.invokeByName(workerName, {
+      method: c.req.method,
+      path: subpath ? `/${subpath}` : "/",
+      query,
+      headers,
+      body,
+    });
+
+    for (const [key, value] of Object.entries(result.headers)) {
+      if (key !== "transfer-encoding" && key !== "content-length") c.header(key, value);
+    }
+    return c.body(result.body, result.status as 200);
+  };
+
+  app.all("/w/:name", forwardToWorker);
+  app.all("/w/:name/*", forwardToWorker);
+
   // --- Public endpoints (no auth) -------------------------------------------
   app.get("/health", (c) => {
     if (deps.health.live()) return c.json({ status: "ok" });
@@ -157,13 +203,21 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
   );
 
   // --- Auth middleware for /api/* -------------------------------------------
+  // Management API accepts: (1) the static key from API_KEY env, or
+  // (2) DB-stored API keys (POST /api/api-keys).
   app.use("/api/*", async (c, next) => {
     const bootstrapMode = process.env.BOOTSTRAP_OPEN_API === "1";
     const isApiKeyCreate = c.req.method === "POST" && c.req.path === "/api/api-keys";
 
     if (!(bootstrapMode && isApiKeyCreate)) {
       const token = (c.req.header("authorization") ?? "").replace(/^Bearer\s+/i, "") || null;
-      const authContext = await auth.authenticate(token);
+      let authContext: { keyId: string; keyName: string } | null = null;
+
+      if (deps.config.apiKey && token === deps.config.apiKey) {
+        authContext = { keyId: "env:API_KEY", keyName: "env-api-key" };
+      } else {
+        authContext = await auth.authenticate(token);
+      }
 
       if (!authContext) {
         return c.json(

@@ -105,11 +105,24 @@ curl -s "http://localhost:3000/api/workers/$WORKER/invoke" -X POST \
 
 ## API
 
-Auth: `Authorization: Bearer wpk_...` для всех `/api/*`. Открытые: `/health`, `/ready`, `/metrics`, `/version`.
+**Workers публичны**: любой может вызвать воркер через `/w/<имя>` — любой метод, путь,
+query и тело форвардятся в изолят напрямую:
+
+```bash
+curl -s "http://localhost:3000/w/my-connector?since=1" -X POST -d '{"action":"sync"}'
+```
+
+**Management API** (`/api/*` — деплой, секреты, D1, KV, логи и т.д.) — только с API-ключом:
+- **Static ключ из `.env`** (`API_KEY=wpk_...`) — для сервер-сервер и CLI
+- **DB-ключи** через `POST /api/api-keys` (показывается один раз)
+
+Auth: `Authorization: Bearer wpk_...` для всех `/api/*`. Открытые без auth:
+`/w/<name>`, `/health`, `/ready`, `/metrics`, `/version`.
 
 | Метод | Путь | Описание |
 |-------|------|----------|
-| POST | `/api/workers` | Создать воркер (имя, лимиты) |
+| ANY | `/w/:name` | **Публичный ingress к воркеру** (без auth; метод/путь/query/body форвардятся) |
+| POST | `/api/workers` | Создать воркер (имя, лимиты) — auth |
 | GET | `/api/workers` | Список (limit/offset) |
 | GET/PATCH/DELETE | `/api/workers/:id` | Детали / обновить / удалить |
 | POST | `/api/workers/:id/versions` | **Деплой**: JSON `{code, manifest}` или multipart `code`+`manifest` |

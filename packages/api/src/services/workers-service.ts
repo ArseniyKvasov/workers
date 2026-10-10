@@ -13,7 +13,7 @@ import type {
 import type { IsolateManager } from "@platform/runtime";
 import type { SecretCrypto } from "@platform/bindings";
 import { DEFAULT_LIMITS, PLATFORM_LIMITS, type Manifest } from "@platform/types";
-import { notFound, payloadTooLarge, limitExceeded, conflict } from "../errors.js";
+import { notFound, payloadTooLarge, limitExceeded, conflict, HttpError } from "../errors.js";
 import { DEPLOY_CODE_MAX_BYTES } from "@platform/types";
 
 export interface WorkersServiceDeps {
@@ -259,6 +259,44 @@ export class WorkersService {
     });
 
     return result;
+  }
+
+  /**
+   * Public ingress: anyone can call a worker by name. Resolves the worker
+   * name to its isolate and forwards the raw request.
+   */
+  async invokeByName(workerName: string, input: {
+    method: string;
+    path: string;
+    query?: Record<string, string>;
+    headers?: Record<string, string>;
+    body?: string;
+  }) {
+    const worker = await this.deps.workers.findActiveByName(workerName);
+    if (!worker) throw notFound("worker", workerName);
+    if (worker.status !== "active") {
+      throw new HttpError(503, "WORKER_PAUSED", `worker "${workerName}" is paused`);
+    }
+    if (!this.deps.isolates.isDeployed(worker.id)) {
+      throw notFound(`deployed worker "${workerName}" — promote a version first`);
+    }
+
+    const result = await this.deps.isolates.invoke({
+      workerId: worker.id,
+      method: input.method,
+      path: input.path,
+      query: input.query,
+      headers: input.headers,
+      body: input.body,
+    });
+
+    await this.deps.usage.recordSample(worker.id, {
+      requestsCount: 1,
+      errorsCount: result.status >= 500 ? 1 : 0,
+      cpuMsTotal: result.metrics.cpuMs,
+    });
+
+    return { workerId: worker.id, ...result };
   }
 
   d1FilePath(workerId: string, name: string): string {

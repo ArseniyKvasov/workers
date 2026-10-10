@@ -45,6 +45,15 @@ export class WorkersRepository {
     return rows[0] as WorkerRow | undefined;
   }
 
+  async findActiveByName(name: string): Promise<WorkerRow | undefined> {
+    const rows = await this.db
+      .select()
+      .from(workers)
+      .where(and(eq(workers.name, name), sql`${workers.status} <> 'deleted'`))
+      .limit(1);
+    return rows[0] as WorkerRow | undefined;
+  }
+
   async listActive(limit: number, offset: number): Promise<WorkerRow[]> {
     const rows = await this.db
       .select()
