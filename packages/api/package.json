@@ -1,0 +1,29 @@
+{
+  "name": "@platform/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "echo 'no tests yet' && exit 0"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "@libsql/client": "^0.14.0",
+    "@platform/bindings": "workspace:*",
+    "@platform/catalog": "workspace:*",
+    "@platform/observability": "workspace:*",
+    "@platform/runtime": "workspace:*",
+    "@platform/types": "workspace:*",
+    "hono": "^4.6.13",
+    "ioredis": "^5.4.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.8"
+  }
+}

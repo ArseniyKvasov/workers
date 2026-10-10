@@ -1,0 +1,29 @@
+{
+  "name": "@platform/control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/main.js",
+    "dev": "tsx watch src/main.ts",
+    "test": "echo 'no tests' && exit 0"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "@libsql/client": "^0.14.0",
+    "@platform/api": "workspace:*",
+    "@platform/bindings": "workspace:*",
+    "@platform/catalog": "workspace:*",
+    "@platform/observability": "workspace:*",
+    "@platform/runtime": "workspace:*",
+    "@platform/types": "workspace:*",
+    "hono": "^4.6.13",
+    "ioredis": "^5.4.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  }
+}
