@@ -1,0 +1,51 @@
+# Workers Platform — nginx reverse proxy (rendered by deploy/production.sh)
+# Placeholders: __DOMAIN__, __ACTIVE_PORT__
+
+upstream workers_platform_app {
+    server 127.0.0.1:__ACTIVE_PORT__;
+    keepalive 32;
+}
+
+server {
+    listen 80;
+    server_name __DOMAIN__;
+
+    # Workers public ingress + control plane API + health endpoints
+    location / {
+        proxy_pass http://workers_platform_app;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Request-Id $request_id;
+        proxy_set_header Connection "";
+
+        # SSE log streams: no buffering, long reads
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+
+        # Worker deploys can carry up to 5 MB of code
+        client_max_body_size 10m;
+    }
+
+    # Instant health probes without access-log noise
+    location = /health {
+        access_log off;
+        proxy_pass http://workers_platform_app;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+    }
+}
+
+# TLS: run certbot --nginx -d __DOMAIN__ or add a 443 server block:
+#
+# server {
+#     listen 443 ssl http2;
+#     server_name __DOMAIN__;
+#     ssl_certificate     /etc/letsencrypt/live/__DOMAIN__/fullchain.pem;
+#     ssl_certificate_key /etc/letsencrypt/live/__DOMAIN__/privkey.pem;
+#     ... (same proxy_pass block as above)
+# }

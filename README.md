@@ -186,6 +186,32 @@ pnpm test             # bindings (D1 локально, Redis при наличи
 pnpm --filter @platform/control-plane dev
 ```
 
+## Production deploy (blue/green, zero downtime)
+
+`deploy/production.sh` разворачивает платформу на сервере в два слота (blue/green):
+
+```
+./deploy/production.sh deploy     # бэкап -> build -> новый слот -> health check ->
+                                  # switch nginx -> стоп старого слота
+./deploy/production.sh status     # состояние слотов, контейнеров, health
+./deploy/production.sh rollback   # передеплой предыдущего образа тем же флоу
+```
+
+Как обеспечивается zero downtime:
+1. **Бэкап в S3 в начале деплоя** (pg_dump каталога + tar D1-данных). Если бэкап не удался — деплой прерывается.
+2. Новый контейнер стартует на **свободном слоте** (PORT=$BLUE_PORT или $GREEN_PORT, `--network host`), nginx продолжает слать трафик в активный.
+3. Скрипт ждёт `/ready` (up to `HEALTH_TIMEOUT`): сервер слушает порт только **после** warm-up, т.е. все воркеры восстановлены из каталога. Health check не прошёл → новый слот удаляется, старый не тронут.
+4. nginx переключается рендером `deploy/nginx.conf.template` (`__DOMAIN__`, `__ACTIVE_PORT__`) + `nginx -t` + reload (без рестарта соединений).
+5. Только после переключения останавливается старый слот (SIGTERM → graceful shutdown 30s).
+
+Настройка на сервере:
+```bash
+cp deploy/.env.production.example deploy/.env.production   # заполнить DOMAIN, порты, S3, ключи
+./deploy/production.sh status
+```
+
+Сеть: скрипт рассчитан на **Linux** (`--network host` — контейнер слушает BLUE/GREEN_PORT напрямую и ходит в localhost PostgreSQL/Redis). D1-данные шарятся между слотами через volume `DATA_DIR_HOST:/data`. TLS добавьте certbot'ом (закомментированный блок в шаблоне nginx). `SKIP_BACKUP=1` и `NGINX_MANAGED_EXTERNALLY=1` — ручные режимы обхода.
+
 ## Production
 
 - Dockerfile (multi-stage, non-root, tini, healthcheck) — `docker build -t workers-platform .`

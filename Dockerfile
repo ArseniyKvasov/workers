@@ -1,5 +1,6 @@
 # Build stage
-FROM node:20-alpine AS build
+# NOTE: workerd binaries require glibc — do NOT use alpine images here.
+FROM node:20-slim AS build
 WORKDIR /app
 RUN corepack enable
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json tsconfig.base.json ./
@@ -9,9 +10,10 @@ RUN pnpm install --frozen-lockfile
 RUN pnpm --filter @platform/control-plane... build
 
 # Runtime stage
-FROM node:20-alpine
+FROM node:20-slim
 WORKDIR /app
-RUN corepack enable && apk add --no-cache tini
+RUN apt-get update && apt-get install -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/*
 ENV NODE_ENV=production
 COPY --from=build /app/package.json /app/pnpm-lock.yaml /app/pnpm-workspace.yaml ./
 COPY --from=build /app/node_modules ./node_modules
@@ -21,7 +23,7 @@ RUN mkdir -p /data && chown node:node /data
 ENV DATA_DIR=/data
 USER node
 EXPOSE 3000
-HEALTHCHECK --interval=10s --timeout=3s --retries=5 \
-  CMD wget -qO- http://localhost:3000/health || exit 1
-ENTRYPOINT ["/sbin/tini", "--"]
+HEALTHCHECK --interval=10s --timeout=5s --retries=5 --start-period=60s \
+  CMD node -e "fetch('http://localhost:'+(process.env.PORT||3000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "apps/control-plane/dist/main.js"]
