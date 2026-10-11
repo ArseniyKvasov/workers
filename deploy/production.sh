@@ -2,7 +2,7 @@
 #
 # Workers Platform — production deploy with blue/green slots.
 #
-#   ./deploy/production.sh deploy    (default) backup -> build -> start new slot
+#   ./deploy/production.sh          (default: deploy) backup -> build -> start new slot
 #                                    -> health check -> switch nginx -> stop old slot
 #   ./deploy/production.sh status    show slots, containers, health, last backup
 #   ./deploy/production.sh rollback  redeploy previous image via the same flow
@@ -50,7 +50,6 @@ load_env() {
   if [[ ! -f "$ENV_FILE" ]]; then
     die "env file not found: $ENV_FILE (copy deploy/.env.production.example)"
   fi
-  # Export KEY=VALUE lines via temp file (process substitution is flaky in some shells)
   local tmp_env
   tmp_env="$(mktemp)"
   grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_FILE" > "$tmp_env"
@@ -148,7 +147,6 @@ apply_backup_retention() {
   [[ "$keep" =~ ^[0-9]+$ ]] || keep=14
   local ep=(); [[ -n "${S3_ENDPOINT:-}" ]] && ep=(--endpoint-url "$S3_ENDPOINT")
 
-  # Delete the oldest backups beyond the retention window
   aws s3 ls "s3://${S3_BACKUP_BUCKET}/${S3_BACKUP_PREFIX}/" "${ep[@]}" 2>/dev/null \
     | awk '{print $NF}' | grep -E '^[0-9]{8}T[0-9]{6}Z$' | sort -r \
     | tail -n +$((keep + 1)) \
@@ -161,6 +159,26 @@ apply_backup_retention() {
 # ---------------------------------------------------------------------------
 # Nginx
 # ---------------------------------------------------------------------------
+ensure_nginx_running() {
+  if [[ "${NGINX_MANAGED_EXTERNALLY:-0}" == "1" ]]; then
+    return 0
+  fi
+  if ! docker ps --format '{{.Names}}' | grep -qx "workers-nginx"; then
+    log "starting nginx via docker compose profile"
+    docker compose --profile nginx up -d nginx
+    # wait for nginx to be ready
+    local waited=0
+    while (( waited < 30 )); do
+      if docker exec workers-nginx nginx -t >/dev/null 2>&1; then
+        return 0
+      fi
+      sleep 1
+      waited=$((waited + 1))
+    done
+    die "nginx failed to start"
+  fi
+}
+
 switch_nginx() {
   local target_slot="$1" template rendered active_container
   template="${SCRIPT_DIR}/nginx.conf.template"
@@ -176,10 +194,12 @@ switch_nginx() {
     return 0
   fi
 
+  ensure_nginx_running
+
   docker cp "$rendered" workers-nginx:/etc/nginx/templates/default.conf.template
   docker exec workers-nginx nginx -t || die "nginx config test failed — keeping old config"
   docker exec workers-nginx nginx -s reload || die "nginx reload failed"
-  log "nginx: traffic switched to port ${active_port} (${DOMAIN})"
+  log "nginx: traffic switched to ${active_container} (${DOMAIN})"
 }
 
 # ---------------------------------------------------------------------------
@@ -355,7 +375,7 @@ cmd_status() {
 
 # ---------------------------------------------------------------------------
 main() {
-  local cmd="${1:-deploy}"
+  local cmd="${1:-deploy}"  # deploy is default
   case "$cmd" in
     deploy)   shift; load_env; cmd_deploy "${1:-}" ;;
     rollback) load_env; cmd_rollback ;;
