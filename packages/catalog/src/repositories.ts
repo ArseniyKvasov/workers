@@ -1,10 +1,9 @@
 import { and, desc, eq, isNotNull, isNull, sql } from "drizzle-orm";
 import type { CatalogDb } from "./client.js";
-import { workers, workerVersions, workerBindings, workerSecrets } from "./schema.js";
+import { workers, workerVersions, workerBindings, workerSecrets, cronJobs } from "./schema.js";
 
 export interface WorkerRow {
   id: string;
-  name: string;
   runtime: string;
   status: string;
   limits: Record<string, unknown>;
@@ -27,7 +26,6 @@ export class WorkersRepository {
   constructor(private readonly db: CatalogDb) {}
 
   async create(input: {
-    name: string;
     runtime: string;
     limits: Record<string, unknown>;
   }): Promise<WorkerRow> {
@@ -41,15 +39,6 @@ export class WorkersRepository {
       .select()
       .from(workers)
       .where(and(eq(workers.id, id), sql`${workers.status} <> 'deleted'`))
-      .limit(1);
-    return rows[0] as WorkerRow | undefined;
-  }
-
-  async findActiveByName(name: string): Promise<WorkerRow | undefined> {
-    const rows = await this.db
-      .select()
-      .from(workers)
-      .where(and(eq(workers.name, name), sql`${workers.status} <> 'deleted'`))
       .limit(1);
     return rows[0] as WorkerRow | undefined;
   }
@@ -75,7 +64,7 @@ export class WorkersRepository {
 
   async update(
     id: string,
-    patch: { name?: string; status?: string; limits?: Record<string, unknown> }
+    patch: { status?: string; limits?: Record<string, unknown> }
   ): Promise<WorkerRow | undefined> {
     const [row] = await this.db
       .update(workers)
@@ -275,5 +264,131 @@ export class SecretsRepository {
 
   async deleteAll(workerId: string): Promise<void> {
     await this.db.delete(workerSecrets).where(eq(workerSecrets.workerId, workerId));
+  }
+}
+
+export interface CronJobRow {
+  id: string;
+  workerId: string;
+  name: string;
+  schedule: string;
+  handler: string;
+  payload: Record<string, unknown>;
+  enabled: number;
+  nextRunAt: Date | null;
+  lastRunAt: Date | null;
+  lastRunStatus: string | null;
+  lastRunError: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export class CronJobsRepository {
+  constructor(private readonly db: CatalogDb) {}
+
+  async create(input: {
+    workerId: string;
+    name: string;
+    schedule: string;
+    handler?: string;
+    payload?: Record<string, unknown>;
+    enabled?: number;
+  }): Promise<CronJobRow> {
+    const [row] = await this.db
+      .insert(cronJobs)
+      .values({
+        workerId: input.workerId,
+        name: input.name,
+        schedule: input.schedule,
+        handler: input.handler ?? "scheduled",
+        payload: input.payload ?? {},
+        enabled: input.enabled ?? 1,
+      })
+      .returning();
+    if (!row) throw new Error("failed to insert cron job");
+    return row as CronJobRow;
+  }
+
+  async find(workerId: string, name: string): Promise<CronJobRow | undefined> {
+    const rows = await this.db
+      .select()
+      .from(cronJobs)
+      .where(and(eq(cronJobs.workerId, workerId), eq(cronJobs.name, name)))
+      .limit(1);
+    return rows[0] as CronJobRow | undefined;
+  }
+
+  async listByWorker(workerId: string): Promise<CronJobRow[]> {
+    const rows = await this.db
+      .select()
+      .from(cronJobs)
+      .where(eq(cronJobs.workerId, workerId))
+      .orderBy(desc(cronJobs.createdAt));
+    return rows as CronJobRow[];
+  }
+
+  async update(
+    workerId: string,
+    name: string,
+    patch: {
+      schedule?: string;
+      handler?: string;
+      payload?: Record<string, unknown>;
+      enabled?: number;
+    }
+  ): Promise<CronJobRow | undefined> {
+    const [row] = await this.db
+      .update(cronJobs)
+      .set({ ...patch, updatedAt: new Date() })
+      .where(and(eq(cronJobs.workerId, workerId), eq(cronJobs.name, name)))
+      .returning();
+    return row as CronJobRow | undefined;
+  }
+
+  async delete(workerId: string, name: string): Promise<boolean> {
+    const rows = await this.db
+      .delete(cronJobs)
+      .where(and(eq(cronJobs.workerId, workerId), eq(cronJobs.name, name)))
+      .returning({ id: cronJobs.id });
+    return rows.length > 0;
+  }
+
+  /** Find jobs that are due to run (nextRunAt <= now and enabled). */
+  async listDue(limit: number): Promise<CronJobRow[]> {
+    const rows = await this.db
+      .select()
+      .from(cronJobs)
+      .where(
+        and(
+          eq(cronJobs.enabled, 1),
+          isNotNull(cronJobs.nextRunAt),
+          sql`${cronJobs.nextRunAt} <= now()`
+        )
+      )
+      .orderBy(cronJobs.nextRunAt)
+      .limit(limit);
+    return rows as CronJobRow[];
+  }
+
+  /** Update next run time after execution. */
+  async updateRunInfo(
+    id: string,
+    info: {
+      nextRunAt: Date;
+      lastRunAt: Date;
+      lastRunStatus: "success" | "failed";
+      lastRunError?: string | null;
+    }
+  ): Promise<void> {
+    await this.db
+      .update(cronJobs)
+      .set({
+        nextRunAt: info.nextRunAt,
+        lastRunAt: info.lastRunAt,
+        lastRunStatus: info.lastRunStatus,
+        lastRunError: info.lastRunError ?? null,
+        updatedAt: new Date(),
+      })
+      .where(eq(cronJobs.id, id));
   }
 }

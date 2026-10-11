@@ -7,6 +7,7 @@ import {
   ApiKeysRepository,
   AuditRepository,
   BindingsRepository,
+  CronJobsRepository,
   D1CatalogRepository,
   KVCatalogRepository,
   QueuesCatalogRepository,
@@ -18,8 +19,16 @@ import {
 import { IsolateManager } from "@platform/runtime";
 import { SecretCrypto } from "@platform/bindings";
 import { HealthService, createLogger, getMetrics } from "@platform/observability";
-import { buildApp, serveApp, type AppConfig } from "@platform/api";
+import {
+  buildApp,
+  serveApp,
+  parseTrustedProxies,
+  DEFAULT_MAX_BODY_BYTES,
+  type AppConfig,
+  WorkersService,
+} from "@platform/api";
 import { UsageBuffer } from "./usage-buffer.js";
+import { CronScheduler } from "@platform/api";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -27,6 +36,11 @@ function requireEnv(name: string): string {
     throw new Error(`required environment variable ${name} is not set`);
   }
   return value;
+}
+
+function intEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 function loadConfig(): AppConfig {
@@ -43,6 +57,16 @@ function loadConfig(): AppConfig {
       .map((d) => d.trim())
       .filter((d) => d.length > 0),
     apiKey: process.env.API_KEY || undefined,
+    maxBodyBytes: intEnv("MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
+    /** Rate limiting for public worker ingress (per IP+worker). */
+    ingressRateLimitPerMinute: intEnv("INGRESS_RATE_LIMIT_PER_MINUTE", 300),
+    ingressRateLimitBurst: intEnv("INGRESS_RATE_LIMIT_BURST", 50),
+    trustedProxies: parseTrustedProxies(process.env.TRUSTED_PROXIES),
+    corsAllowedOrigins: (process.env.CORS_ALLOWED_ORIGINS ?? "")
+      .split(",")
+      .map((o) => o.trim())
+      .filter((o) => o.length > 0),
+    metricsToken: process.env.METRICS_TOKEN || undefined,
   };
 }
 
@@ -74,6 +98,7 @@ async function main() {
     usage: new UsageRepository(db),
     audit: new AuditRepository(db),
     apiKeys: new ApiKeysRepository(db),
+    cronJobs: new CronJobsRepository(db),
   };
 
   // --- Runtime ---------------------------------------------------------------
@@ -136,6 +161,28 @@ async function main() {
     logger.warn({ error: String(error) }, "worker warm-up skipped");
   }
 
+  // --- Cron Scheduler -----------------------------------------------------------
+  const cronScheduler = new CronScheduler({
+    cronJobs: repositories.cronJobs,
+    workersService: new WorkersService({
+      workers: repositories.workers,
+      versions: repositories.versions,
+      bindingsRepo: repositories.bindings,
+      secretsRepo: repositories.secrets,
+      d1Catalog: repositories.d1Catalog,
+      kvCatalog: repositories.kvCatalog,
+      queuesCatalog: repositories.queuesCatalog,
+      usage: repositories.usage,
+      isolates,
+      secretCrypto,
+      dataDir: config.dataDir,
+    }),
+    logger,
+    scanIntervalMs: 30_000,
+    batchSize: 100,
+  });
+  cronScheduler.start();
+
   // --- Health ------------------------------------------------------------------
   const health = new HealthService();
   health.register("postgres", async () => {
@@ -178,6 +225,7 @@ async function main() {
 
     try {
       await stop(); // stop accepting new connections
+      cronScheduler.stop(); // stop cron scheduler
       await isolates.stopAll(30_000); // drain in-flight, dispose isolates
       await usageBuffer.stop(); // flush remaining usage deltas
       redis.disconnect();
@@ -194,6 +242,29 @@ async function main() {
 
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));
+
+  // Fatal errors: log, flush usage metrics, exit non-zero. Without these an
+  // unhandled rejection in background work kills the process silently mid-flight.
+  const fatal = async (kind: string, error: unknown) => {
+    logger.fatal({ kind, error: error instanceof Error ? error.stack : String(error) }, "fatal error");
+    if (shuttingDown) return;
+    shuttingDown = true;
+    try {
+      await Promise.race([
+        (async () => {
+          await stop();
+          await usageBuffer.stop();
+        })(),
+        new Promise((resolve) => setTimeout(resolve, 10_000)),
+      ]);
+    } catch (flushError) {
+      logger.error({ error: String(flushError) }, "error flushing state before fatal exit");
+    }
+    redis.disconnect();
+    process.exit(1);
+  };
+  process.on("uncaughtException", (error) => void fatal("uncaughtException", error));
+  process.on("unhandledRejection", (reason) => void fatal("unhandledRejection", reason));
 }
 
 main().catch((error) => {

@@ -14,6 +14,8 @@ export interface EgressConfig {
   allowedDomains: string[];
   /** Whether private/internal IPs are always blocked (default true). */
   blockPrivateIps?: boolean;
+  /** Abort outbound fetches after this long (default 30s). */
+  timeoutMs?: number;
 }
 
 export class EgressBlockedError extends Error {
@@ -61,6 +63,7 @@ export function createOutboundService(
   hooks: { onEgressBytes?: (workerId: string, bytes: number) => void } = {}
 ): (request: Request) => Promise<Response> {
   const blockPrivate = config.blockPrivateIps ?? true;
+  const timeoutMs = config.timeoutMs ?? 30_000;
 
   return async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
@@ -95,10 +98,12 @@ export function createOutboundService(
     const body = request.body ? await request.clone().arrayBuffer() : null;
     hooks.onEgressBytes?.(workerId, body?.byteLength ?? 0);
 
+    // Never let a hung upstream pin a worker isolate indefinitely.
     return fetch(url, {
       method: request.method,
       headers: request.headers,
       body: body as ArrayBuffer | null,
+      signal: AbortSignal.timeout(timeoutMs),
     });
   };
 }

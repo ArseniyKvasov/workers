@@ -29,3 +29,7 @@ export function limitExceeded(message: string): HttpError {
 export function payloadTooLarge(message: string): HttpError {
   return new HttpError(413, "PAYLOAD_TOO_LARGE", message);
 }
+
+export function unauthorized(message: string): HttpError {
+  return new HttpError(401, "UNAUTHORIZED", message);
+}

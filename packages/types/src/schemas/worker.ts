@@ -32,18 +32,12 @@ export const manifestSchema = z.object({
 export type Manifest = z.infer<typeof manifestSchema>;
 
 export const workerCreateSchema = z.object({
-  name: z
-    .string()
-    .min(1)
-    .max(64)
-    .regex(/^[a-z0-9][a-z0-9-]*$/, "lowercase letters, digits and dashes only"),
   runtime: runtimeSchema.default("workerd@v1"),
   limits: limitsSchema.optional(),
 });
 export type WorkerCreate = z.infer<typeof workerCreateSchema>;
 
 export const workerUpdateSchema = z.object({
-  name: workerCreateSchema.shape.name.optional(),
   status: z.enum(["active", "paused"]).optional(),
   limits: limitsSchema.partial().optional(),
 });
@@ -76,7 +70,6 @@ export type WorkerVersion = z.infer<typeof versionSchema>;
 
 export const workerSchema = z.object({
   id: z.string(),
-  name: z.string(),
   runtime: runtimeSchema,
   status: z.enum(["active", "paused", "deleted"]),
   limits: limitsSchema,

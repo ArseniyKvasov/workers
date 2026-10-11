@@ -30,6 +30,7 @@ async function api<T>(method: string, path: string, body?: unknown): Promise<T> 
       ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(30_000),
   });
 
   const json = (await response.json()) as { data?: T; error?: { message: string } };
@@ -59,12 +60,10 @@ const worker = program.command("worker").description("manage workers");
 
 worker
   .command("create")
-  .argument("<name>", "worker name")
   .option("--cpu-ms <n>", "CPU limit in ms", "5000")
   .option("--memory-mb <n>", "memory limit in MB", "128")
-  .action(async (name: string, opts: { cpuMs: string; memoryMb: string }) => {
+  .action(async (opts: { cpuMs: string; memoryMb: string }) => {
     const created = await api<{ id: string }>("POST", "/api/workers", {
-      name,
       limits: { cpu_ms: Number(opts.cpuMs), memory_mb: Number(opts.memoryMb) },
     });
     console.log(`Worker created: ${created.id}`);
@@ -88,6 +87,8 @@ worker
         code: source,
         manifest: opts.manifest ? JSON.parse(opts.manifest) : undefined,
       }),
+      // Uploads can be large; allow up to 5 minutes.
+      signal: AbortSignal.timeout(300_000),
     });
     const json = (await response.json()) as {
       data?: { version_id: string; bundle_size: number };
@@ -141,9 +142,9 @@ worker
 worker
   .command("list")
   .action(async () => {
-    const result = await api<Array<{ id: string; name: string; status: string }>>("GET", "/api/workers");
+    const result = await api<Array<{ id: string; status: string }>>("GET", "/api/workers");
     for (const w of result ?? []) {
-      console.log(`${w.id}  ${w.name}  [${w.status}]`);
+      console.log(`${w.id}  [${w.status}]`);
     }
   });
 

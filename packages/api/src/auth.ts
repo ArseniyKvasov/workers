@@ -37,11 +37,13 @@ export class AuthService {
   async authenticate(token: string | null): Promise<AuthContext | null> {
     if (!token || !token.startsWith("wpk_")) return null;
 
-    // Key format: wpk_<prefix>_<secret>; the base64url prefix itself may
-    // contain underscores, so the prefix is everything before the LAST "_".
-    const lastUnderscore = token.lastIndexOf("_");
-    if (lastUnderscore <= 4) return null;
-    const prefix = token.slice(4, lastUnderscore);
+    // Key format: wpk_<prefix>_<secret>. Both parts are base64url and MAY
+    // contain underscores, so the prefix must be split positionally: 12
+    // random bytes encode to exactly 16 base64url chars (no padding).
+    const PREFIX_B64_LEN = 16;
+    if (token.length <= 4 + PREFIX_B64_LEN + 1) return null;
+    if (token[4 + PREFIX_B64_LEN] !== "_") return null;
+    const prefix = token.slice(4, 4 + PREFIX_B64_LEN);
 
     const record = await this.apiKeys.findByPrefix(prefix);
     if (!record || record.revokedAt) return null;
@@ -66,3 +68,5 @@ function timingSafeEqualStr(a: string, b: string): boolean {
   }
   return diff === 0;
 }
+
+export { timingSafeEqualStr };

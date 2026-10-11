@@ -79,8 +79,8 @@ console.log('API_KEY:', key);
 curl http://localhost:8080/health
 curl http://localhost:8080/ready
 
-# Публичный ingress воркера (без auth, через nginx на 8080)
-curl -X POST http://localhost:8080/w/my-worker -d '{"action":"test"}'
+# Публичный ingress воркера (без auth, через nginx на 8080; адрес — UUID воркера)
+curl -X POST http://localhost:8080/w/<worker-uuid> -d '{"action":"test"}'
 
 # Management API (требует API_KEY из .env)
 curl -H "Authorization: Bearer $API_KEY" http://localhost:8080/api/workers
@@ -121,10 +121,10 @@ curl -s http://localhost:3000/api/api-keys -X POST \
 ## Пример: деплой воркера
 
 ```bash
-# 1. Создать воркер
+# 1. Создать воркер (id генерируется автоматически)
 WORKER=$(curl -s http://localhost:3000/api/workers \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-  -d '{"name":"my-connector"}' | jq -r .data.id)
+  -d '{}' | jq -r .data.id)
 
 # 2. Создать ресурсы
 curl -s http://localhost:3000/api/d1 -X POST -H "Authorization: Bearer $KEY" \
@@ -164,11 +164,11 @@ curl -s "http://localhost:3000/api/workers/$WORKER/invoke" -X POST \
 
 ## API
 
-**Workers публичны**: любой может вызвать воркер через `/w/<имя>` — любой метод, путь,
+**Workers публичны**: любой может вызвать воркер через `/w/<uuid>` — любой метод, путь,
 query и тело форвардятся в изолят напрямую:
 
 ```bash
-curl -s "http://localhost:8080/w/my-connector?since=1" -X POST -d '{"action":"sync"}'
+curl -s "http://localhost:8080/w/$WORKER?since=1" -X POST -d '{"action":"sync"}'
 ```
 
 **Management API** (`/api/*` — деплой, секреты, D1, KV, логи и т.д.) — только с API-ключом:
@@ -176,12 +176,12 @@ curl -s "http://localhost:8080/w/my-connector?since=1" -X POST -d '{"action":"sy
 - **DB-ключи** через `POST /api/api-keys` (показывается один раз)
 
 Auth: `Authorization: Bearer wpk_...` для всех `/api/*`. Открытые без auth:
-`/w/<name>`, `/health`, `/ready`, `/metrics`, `/version`.
+`/w/<uuid>`, `/health`, `/ready`, `/metrics`, `/version`.
 
 | Метод | Путь | Описание |
 |-------|------|----------|
-| ANY | `/w/:name` | **Публичный ingress к воркеру** (без auth; метод/путь/query/body форвардятся) |
-| POST | `/api/workers` | Создать воркер (имя, лимиты) — auth |
+| ANY | `/w/:id` | **Публичный ingress к воркеру по UUID** (без auth; метод/путь/query/body форвардятся) |
+| POST | `/api/workers` | Создать воркер (лимиты; UUID генерируется автоматически) — auth |
 | GET | `/api/workers` | Список (limit/offset) |
 | GET/PATCH/DELETE | `/api/workers/:id` | Детали / обновить / удалить |
 | POST | `/api/workers/:id/versions` | **Деплой**: JSON `{code, manifest}` или multipart `code`+`manifest` |

@@ -12,9 +12,8 @@ import type {
 } from "@platform/catalog";
 import type { IsolateManager } from "@platform/runtime";
 import type { SecretCrypto } from "@platform/bindings";
-import { DEFAULT_LIMITS, PLATFORM_LIMITS, type Manifest } from "@platform/types";
-import { notFound, payloadTooLarge, limitExceeded, conflict, HttpError } from "../errors.js";
-import { DEPLOY_CODE_MAX_BYTES } from "@platform/types";
+import { DEFAULT_LIMITS, PLATFORM_LIMITS, DEPLOY_CODE_MAX_BYTES, type Manifest } from "@platform/types";
+import { notFound, payloadTooLarge, limitExceeded, HttpError } from "../errors.js";
 
 export interface WorkersServiceDeps {
   workers: WorkersRepository;
@@ -34,20 +33,15 @@ export class WorkersService {
   constructor(private readonly deps: WorkersServiceDeps) {}
 
   async createWorker(input: {
-    name: string;
     runtime: string;
     limits?: Partial<{ cpu_ms: number; memory_mb: number; concurrency: number }>;
   }) {
     const existing = await this.deps.workers.listActive(1000, 0);
-    if (existing.some((w) => w.name === input.name)) {
-      throw conflict(`worker "${input.name}" already exists`);
-    }
     if (existing.length >= PLATFORM_LIMITS.max_workers) {
       throw limitExceeded(`platform worker limit (${PLATFORM_LIMITS.max_workers}) reached`);
     }
 
     const worker = await this.deps.workers.create({
-      name: input.name,
       runtime: input.runtime,
       limits: { ...DEFAULT_LIMITS, ...(input.limits ?? {}) } as Record<string, unknown>,
     });
@@ -68,7 +62,7 @@ export class WorkersService {
     return { items, total };
   }
 
-  async updateWorker(id: string, patch: { name?: string; status?: string; limits?: Record<string, unknown> }) {
+  async updateWorker(id: string, patch: { status?: string; limits?: Record<string, unknown> }) {
     await this.getWorker(id);
     const updated = await this.deps.workers.update(id, patch);
     return updated;
@@ -258,31 +252,32 @@ export class WorkersService {
       cpuMsTotal: result.metrics.cpuMs,
     });
 
-    return result;
+    // JSON API returns UTF-8 text (binary responses are not representable here).
+    return { ...result, body: result.bodyText };
   }
 
   /**
-   * Public ingress: anyone can call a worker by name. Resolves the worker
-   * name to its isolate and forwards the raw request.
+   * Public ingress: invoke a worker by id (rate-limited by IP).
    */
-  async invokeByName(workerName: string, input: {
+  async invokeById(workerId: string, input: {
     method: string;
     path: string;
     query?: Record<string, string>;
     headers?: Record<string, string>;
-    body?: string;
+    body?: string | Uint8Array;
   }) {
-    const worker = await this.deps.workers.findActiveByName(workerName);
-    if (!worker) throw notFound("worker", workerName);
+    const worker = await this.deps.workers.findActive(workerId);
+    if (!worker) throw notFound("worker", workerId);
     if (worker.status !== "active") {
-      throw new HttpError(503, "WORKER_PAUSED", `worker "${workerName}" is paused`);
+      throw new HttpError(503, "WORKER_PAUSED", `worker "${workerId}" is paused`);
     }
-    if (!this.deps.isolates.isDeployed(worker.id)) {
-      throw notFound(`deployed worker "${workerName}" — promote a version first`);
+
+    if (!this.deps.isolates.isDeployed(workerId)) {
+      throw notFound(`deployed worker "${workerId}" — promote a version first`);
     }
 
     const result = await this.deps.isolates.invoke({
-      workerId: worker.id,
+      workerId,
       method: input.method,
       path: input.path,
       query: input.query,
@@ -290,13 +285,13 @@ export class WorkersService {
       body: input.body,
     });
 
-    await this.deps.usage.recordSample(worker.id, {
+    await this.deps.usage.recordSample(workerId, {
       requestsCount: 1,
       errorsCount: result.status >= 500 ? 1 : 0,
       cpuMsTotal: result.metrics.cpuMs,
     });
 
-    return { workerId: worker.id, ...result };
+    return { workerId, status: result.status, body: result.body, headers: result.headers };
   }
 
   d1FilePath(workerId: string, name: string): string {

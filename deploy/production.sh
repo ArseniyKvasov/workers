@@ -201,6 +201,15 @@ preflight() {
   if [[ "${#missing[@]}" -eq 0 ]]; then log "preflight ok: required env vars set"
   else err "preflight FAIL: missing env vars: ${missing[*]}"; failures=$((failures + 1)); fi
 
+  # BOOTSTRAP_OPEN_API disables auth on POST /api/api-keys; refuse to deploy
+  # it enabled unless explicitly overridden (one-shot bootstrap recovery).
+  if [[ "${BOOTSTRAP_OPEN_API:-}" == "1" && "${ALLOW_BOOTSTRAP:-0}" != "1" ]]; then
+    err "preflight FAIL: BOOTSTRAP_OPEN_API=1 leaves POST /api/api-keys unauthenticated"
+    failures=$((failures + 1))
+  else
+    log "preflight ok: bootstrap API lock is closed"
+  fi
+
   if [[ "$(blue_port)" == "$(green_port)" ]]; then
     err "preflight FAIL: BLUE_PORT and GREEN_PORT must differ"
     failures=$((failures + 1))

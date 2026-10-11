@@ -7,10 +7,11 @@ services:
     container_name: workers-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set a strong POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-workers_platform}
-    ports:
-      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    # Expose to host only for debugging: uncomment and firewall.
+    # ports:
+    #   - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -24,13 +25,16 @@ services:
   redis:
     image: redis:7-alpine
     container_name: workers-redis
-    command: redis-server --appendonly yes
-    ports:
-      - "${REDIS_HOST_PORT:-6380}:6379"
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    # Expose to host only for debugging: uncomment and firewall.
+    # ports:
+    #   - "127.0.0.1:${REDIS_HOST_PORT:-6380}:6379"
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a $${REDIS_PASSWORD} ping | grep PONG"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -45,8 +49,8 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=3000
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-workers_platform}
-      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-workers_platform}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
       - SECRETS_MASTER_KEY=${SECRETS_MASTER_KEY}
       - API_KEY=${API_KEY}
       - DOMAIN=${DOMAIN}
@@ -54,6 +58,14 @@ services:
       - GREEN_PORT=3200
       - DATA_DIR=/data
       - EGRESS_ALLOWED_DOMAINS=${EGRESS_ALLOWED_DOMAINS}
+      - INGRESS_AUTH_REQUIRED=${INGRESS_AUTH_REQUIRED:-1}
+      - INGRESS_RATE_LIMIT_PER_MINUTE=${INGRESS_RATE_LIMIT_PER_MINUTE:-300}
+      - INGRESS_RATE_LIMIT_BURST=${INGRESS_RATE_LIMIT_BURST:-50}
+      - MAX_BODY_BYTES=${MAX_BODY_BYTES:-10485760}
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS}
+      - METRICS_TOKEN=${METRICS_TOKEN}
+      - EGRESS_TIMEOUT_MS=${EGRESS_TIMEOUT_MS:-30000}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - RUNTIME_LOG_LEVEL=${RUNTIME_LOG_LEVEL:-warn}
       - SERVICE_NAME=workers-platform
@@ -88,8 +100,8 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=3000
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-workers_platform}
-      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-workers_platform}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
       - SECRETS_MASTER_KEY=${SECRETS_MASTER_KEY}
       - API_KEY=${API_KEY}
       - DOMAIN=${DOMAIN}
@@ -97,6 +109,14 @@ services:
       - GREEN_PORT=${GREEN_PORT:-3200}
       - DATA_DIR=/data
       - EGRESS_ALLOWED_DOMAINS=${EGRESS_ALLOWED_DOMAINS}
+      - INGRESS_AUTH_REQUIRED=${INGRESS_AUTH_REQUIRED:-1}
+      - INGRESS_RATE_LIMIT_PER_MINUTE=${INGRESS_RATE_LIMIT_PER_MINUTE:-300}
+      - INGRESS_RATE_LIMIT_BURST=${INGRESS_RATE_LIMIT_BURST:-50}
+      - MAX_BODY_BYTES=${MAX_BODY_BYTES:-10485760}
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS}
+      - METRICS_TOKEN=${METRICS_TOKEN}
+      - EGRESS_TIMEOUT_MS=${EGRESS_TIMEOUT_MS:-30000}
       - API_RATE_LIMIT_PER_MINUTE=${API_RATE_LIMIT_PER_MINUTE:-600}
       - API_RATE_LIMIT_BURST=${API_RATE_LIMIT_BURST:-100}
       - LOG_LEVEL=${LOG_LEVEL:-info}
@@ -130,8 +150,8 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=3000
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-workers_platform}
-      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-workers_platform}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
       - SECRETS_MASTER_KEY=${SECRETS_MASTER_KEY}
       - API_KEY=${API_KEY}
       - DOMAIN=${DOMAIN}
@@ -139,6 +159,14 @@ services:
       - GREEN_PORT=${GREEN_PORT:-3200}
       - DATA_DIR=/data
       - EGRESS_ALLOWED_DOMAINS=${EGRESS_ALLOWED_DOMAINS}
+      - INGRESS_AUTH_REQUIRED=${INGRESS_AUTH_REQUIRED:-1}
+      - INGRESS_RATE_LIMIT_PER_MINUTE=${INGRESS_RATE_LIMIT_PER_MINUTE:-300}
+      - INGRESS_RATE_LIMIT_BURST=${INGRESS_RATE_LIMIT_BURST:-50}
+      - MAX_BODY_BYTES=${MAX_BODY_BYTES:-10485760}
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS}
+      - METRICS_TOKEN=${METRICS_TOKEN}
+      - EGRESS_TIMEOUT_MS=${EGRESS_TIMEOUT_MS:-30000}
       - API_RATE_LIMIT_PER_MINUTE=${API_RATE_LIMIT_PER_MINUTE:-600}
       - API_RATE_LIMIT_BURST=${API_RATE_LIMIT_BURST:-100}
       - LOG_LEVEL=${LOG_LEVEL:-info}

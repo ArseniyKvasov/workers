@@ -2,10 +2,10 @@ import { Hono } from "hono";
 import type { WorkersService } from "../services/workers-service.js";
 import { badRequest } from "../errors.js";
 import { workerCreateSchema, workerUpdateSchema, invokeSchema } from "@platform/types";
+import { readBodyCapped } from "../body-limit.js";
 
 function serializeWorker(w: {
   id: string;
-  name: string;
   runtime: string;
   status: string;
   limits: unknown;
@@ -14,7 +14,6 @@ function serializeWorker(w: {
 }) {
   return {
     id: w.id,
-    name: w.name,
     runtime: w.runtime,
     status: w.status,
     limits: w.limits,
@@ -23,7 +22,7 @@ function serializeWorker(w: {
   };
 }
 
-export function workersRoutes(deps: { workersService: WorkersService }): Hono {
+export function workersRoutes(deps: { workersService: WorkersService; maxBodyBytes: number }): Hono {
   const app = new Hono();
 
   // --- Workers CRUD -------------------------------------------------------
@@ -84,7 +83,14 @@ export function workersRoutes(deps: { workersService: WorkersService }): Hono {
         }
       }
     } else {
-      const body = await c.req.json<{ code?: string; manifest?: Record<string, unknown> }>();
+      // Cap the read: chunked requests bypass the Content-Length middleware.
+      const raw = await readBodyCapped(c.req.raw, deps.maxBodyBytes);
+      let body: { code?: string; manifest?: Record<string, unknown> };
+      try {
+        body = JSON.parse(new TextDecoder().decode(raw));
+      } catch {
+        throw badRequest("JSON body is not valid JSON");
+      }
       if (typeof body.code !== "string" || body.code.length === 0) {
         throw badRequest("JSON body must contain non-empty 'code' string");
       }

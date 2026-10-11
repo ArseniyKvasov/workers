@@ -16,17 +16,13 @@ export const workers = pgTable(
   "workers",
   {
     id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
-    name: text("name").notNull(),
     runtime: text("runtime").notNull().default("workerd@v1"),
     status: text("status").notNull().default("active"), // active | paused | deleted
     limits: jsonb("limits").notNull().default(sql`'{}'::jsonb`),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [
-    uniqueIndex("workers_name_uq").on(t.name),
-    index("workers_status_idx").on(t.status),
-  ],
+  (t) => [index("workers_status_idx").on(t.status)],
 );
 
 /** Immutable versions of worker code. Exactly one may be promoted at a time. */
@@ -202,4 +198,39 @@ export const usageMetrics = pgTable(
     queueMessages: bigint("queue_messages", { mode: "number" }).notNull().default(0),
   },
     (t) => [uniqueIndex("usage_metrics_worker_bucket_idx").on(t.workerId, t.bucketStart)],
+);
+
+/** Cron jobs: scheduled triggers that invoke a worker handler. */
+export const cronJobs = pgTable(
+  "cron_jobs",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    workerId: uuid("worker_id")
+      .notNull()
+      .references(() => workers.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    /** Standard 5-field cron expression (minute hour day month dow) in UTC. */
+    schedule: text("schedule").notNull(),
+    /** Entry point handler in the worker code, e.g. "scheduled" or "cron:daily". */
+    handler: text("handler").notNull().default("scheduled"),
+    /** Optional JSON payload passed to the handler. */
+    payload: jsonb("payload").notNull().default(sql`'{}'::jsonb`),
+    /** Whether the job is enabled. */
+    enabled: integer("enabled").notNull().default(1),
+    /** Next run time in UTC (computed by scheduler). */
+    nextRunAt: timestamp("next_run_at", { withTimezone: true }),
+    /** Last run time in UTC. */
+    lastRunAt: timestamp("last_run_at", { withTimezone: true }),
+    /** Last run status: success | failed. */
+    lastRunStatus: text("last_run_status"),
+    /** Last run error message. */
+    lastRunError: text("last_run_error"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("cron_jobs_worker_name_uq").on(t.workerId, t.name),
+    index("cron_jobs_worker_idx").on(t.workerId),
+    index("cron_jobs_next_run_idx").on(t.nextRunAt),
+  ],
 );

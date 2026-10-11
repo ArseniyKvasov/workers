@@ -4,6 +4,7 @@ export * from "./schemas/kv.js";
 export * from "./schemas/queue.js";
 export * from "./schemas/secrets.js";
 export * from "./schemas/common.js";
+export * from "./schemas/cron.js";
 
 /** Well-known error codes returned by the platform API. */
 export const ErrorCodes = {

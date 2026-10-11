@@ -11,14 +11,17 @@ import type { IsolateManager } from "@platform/runtime";
 import type { Logger, MetricsRegistry, HealthService } from "@platform/observability";
 import { z } from "zod";
 
-import { AuthService } from "./auth.js";
+import { AuthService, timingSafeEqualStr } from "./auth.js";
 import { RateLimiter } from "./rate-limit.js";
 import { HttpError } from "./errors.js";
+import { bodyLimitMiddleware, readBodyCapped } from "./body-limit.js";
+import { getClientIp } from "./client-ip.js";
 import { WorkersService } from "./services/workers-service.js";
 import { workersRoutes } from "./routes/workers.js";
 import { d1Routes, kvRoutes, queuesRoutes } from "./routes/resources.js";
 import { secretsRoutes } from "./routes/secrets.js";
 import { apiKeyRoutes } from "./routes/api-keys.js";
+import { cronRoutes } from "./routes/cron.js";
 import type {
   WorkersRepository,
   VersionsRepository,
@@ -30,6 +33,7 @@ import type {
   UsageRepository,
   AuditRepository,
   ApiKeysRepository,
+  CronJobsRepository,
 } from "@platform/catalog";
 import { join } from "node:path";
 
@@ -44,6 +48,17 @@ export interface AppConfig {
   egressAllowedDomains: string[];
   /** Static management API key from env; also accepts DB-stored keys. */
   apiKey?: string;
+  /** Cap for request bodies (413 above); default 10 MB. */
+  maxBodyBytes: number;
+  /** Rate limiting for public worker ingress (per IP+worker). */
+  ingressRateLimitPerMinute: number;
+  ingressRateLimitBurst: number;
+  /** CIDRs/IPs allowed to set x-forwarded-for (reverse proxies). */
+  trustedProxies: string[];
+  /** CORS allowlist; empty = no CORS headers emitted at all. */
+  corsAllowedOrigins: string[];
+  /** When set, /metrics requires this bearer token. */
+  metricsToken?: string;
 }
 
 export interface AppRepositories {
@@ -57,6 +72,7 @@ export interface AppRepositories {
   usage: UsageRepository;
   audit: AuditRepository;
   apiKeys: ApiKeysRepository;
+  cronJobs: CronJobsRepository;
 }
 
 export interface AppDeps {
@@ -89,6 +105,10 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
     perMinute: deps.config.rateLimitPerMinute,
     burst: deps.config.rateLimitBurst,
   });
+  const ingressRateLimiter = new RateLimiter({
+    perMinute: deps.config.ingressRateLimitPerMinute,
+    burst: deps.config.ingressRateLimitBurst,
+  });
 
   const workersService = new WorkersService({
     workers: deps.repositories.workers,
@@ -106,9 +126,25 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
 
   // --- Global middleware ---------------------------------------------------
   app.use(secureHeaders());
-  app.use("*", cors({ origin: (origin) => origin, allowHeaders: ["Authorization", "Content-Type", "x-worker-id"] }));
+  app.use("*", bodyLimitMiddleware(deps.config.maxBodyBytes));
+  if (deps.config.corsAllowedOrigins.length > 0) {
+    const allowed = new Set(deps.config.corsAllowedOrigins);
+    app.use(
+      "*",
+      cors({
+        origin: (origin) => (allowed.has(origin) ? origin : null),
+        allowHeaders: ["Authorization", "Content-Type", "x-worker-id", "x-ingress-token"],
+      })
+    );
+  }
   if (process.env.NODE_ENV !== "production") {
     app.use(honoLogger());
+  }
+
+  if (process.env.BOOTSTRAP_OPEN_API === "1" && process.env.NODE_ENV === "production") {
+    deps.logger.warn(
+      "BOOTSTRAP_OPEN_API=1 in production: POST /api/api-keys is UNAUTHENTICATED. Finish bootstrapping and unset it immediately."
+    );
   }
 
   // Request ID + logging + metrics + auth + rate limiting
@@ -138,34 +174,50 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
     );
   });
 
-  // --- Public worker ingress (no auth): anyone can invoke a worker ---------
+  // --- Public worker ingress (rate-limited by IP): invoke a worker by id -------
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  // Rate limit the public ingress before any processing (per IP + worker).
+  const ingressKey = (c: Context<AppVariables>) =>
+    `${c.req.param("id") ?? "?"}:${getClientIp(c, deps.config.trustedProxies)}`;
+  app.use("/w/:id", ingressRateLimiter.middleware(ingressKey));
+  app.use("/w/:id/*", ingressRateLimiter.middleware(ingressKey));
+
   const forwardToWorker = async (c: Context<AppVariables>) => {
-    const workerName = c.req.param("name");
+    const workerId = c.req.param("id");
     const subpath = c.req.param("0") ?? "";
-    if (!workerName) {
-      return c.json({ error: { code: "NOT_FOUND", message: "worker name is required" } }, 404);
+    if (!workerId || !UUID_RE.test(workerId)) {
+      return c.json({ error: { code: "NOT_FOUND", message: "worker id is required" } }, 404);
     }
 
     const query: Record<string, string> = {};
-    c.req.raw.url
-      .split("?")[1]
-      ?.split("&")
-      .filter((pair) => pair.length > 0)
-      .forEach((pair) => {
-        const [key, ...rest] = pair.split("=");
-        query[decodeURIComponent(key!)] = decodeURIComponent(rest.join("="));
-      });
+    try {
+      c.req.raw.url
+        .split("?")[1]
+        ?.split("&")
+        .filter((pair) => pair.length > 0)
+        .forEach((pair) => {
+          const [key, ...rest] = pair.split("=");
+          query[decodeURIComponent(key!)] = decodeURIComponent(rest.join("="));
+        });
+    } catch {
+      return c.json(
+        { error: { code: "VALIDATION_ERROR", message: "malformed query string" } },
+        400
+      );
+    }
 
     const headers: Record<string, string> = {};
     c.req.raw.headers.forEach((value, key) => {
       if (key !== "host" && key !== "connection") headers[key] = value;
     });
 
-    const body = ["GET", "HEAD"].includes(c.req.method)
-      ? undefined
-      : Buffer.from(await c.req.raw.arrayBuffer()).toString("utf8");
+    const body =
+      ["GET", "HEAD"].includes(c.req.method) || c.req.raw.body === null
+        ? undefined
+        : await readBodyCapped(c.req.raw, deps.config.maxBodyBytes);
 
-    const result = await workersService.invokeByName(workerName, {
+    const result = await workersService.invokeById(workerId, {
       method: c.req.method,
       path: subpath ? `/${subpath}` : "/",
       query,
@@ -176,11 +228,11 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
     for (const [key, value] of Object.entries(result.headers)) {
       if (key !== "transfer-encoding" && key !== "content-length") c.header(key, value);
     }
-    return c.body(result.body, result.status as 200);
+    return c.body(result.body.buffer as ArrayBuffer, result.status as 200);
   };
 
-  app.all("/w/:name", forwardToWorker);
-  app.all("/w/:name/*", forwardToWorker);
+  app.all("/w/:id", forwardToWorker);
+  app.all("/w/:id/*", forwardToWorker);
 
   // --- Public endpoints (no auth) -------------------------------------------
   app.get("/health", (c) => {
@@ -194,6 +246,14 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
   });
 
   app.get("/metrics", async (c) => {
+    if (deps.config.metricsToken) {
+      const token = (c.req.header("authorization") ?? "").replace(/^Bearer\s+/i, "");
+      if (!token || !timingSafeEqualStr(token, deps.config.metricsToken)) {
+        return c.json({ error: { code: "UNAUTHORIZED", message: "metrics token required" } }, 401);
+      }
+    } else if (process.env.NODE_ENV === "production") {
+      deps.logger.warn("GET /metrics without METRICS_TOKEN: metrics are publicly exposed");
+    }
     c.header("content-type", "text/plain; version=0.0.4; charset=utf-8");
     return c.body(await deps.metrics.serve());
   });
@@ -228,6 +288,11 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
 
       c.set("apiKeyId", authContext.keyId);
       c.set("apiKeyName", authContext.keyName);
+    } else if (process.env.NODE_ENV === "production") {
+      deps.logger.warn(
+        { request_id: c.get("requestId") },
+        "BOOTSTRAP_OPEN_API=1: issuing management API key WITHOUT authentication"
+      );
     }
     await next();
   });
@@ -246,7 +311,7 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
             action: `${c.req.method} ${c.req.path}`,
             resourceType: "http_request",
             resourceId: c.req.path,
-            ip: c.req.header("x-forwarded-for") ?? null,
+            ip: getClientIp(c, deps.config.trustedProxies),
             userAgent: c.req.header("user-agent") ?? null,
             changes: c.res.status < 400 ? { status: c.res.status } : { status: c.res.status },
           });
@@ -259,11 +324,12 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
 
   // --- API routes -------------------------------------------------------------
   const api = new Hono();
-  api.route("/", workersRoutes({ workersService }));
+  api.route("/", workersRoutes({ workersService, maxBodyBytes: deps.config.maxBodyBytes }));
   api.route("/", d1Routes({ workersService, d1Catalog: deps.repositories.d1Catalog }));
   api.route("/", kvRoutes({ workersService, kvCatalog: deps.repositories.kvCatalog, redis: deps.redis }));
   api.route("/", queuesRoutes({ workersService, queuesCatalog: deps.repositories.queuesCatalog, redis: deps.redis }));
   api.route("/", secretsRoutes({ secretsRepo: deps.repositories.secrets, secretCrypto: deps.secretCrypto }));
+  api.route("/cron", cronRoutes({ workersService, cronJobs: deps.repositories.cronJobs }));
   api.route("/api-keys", apiKeyRoutes({ apiKeys: deps.repositories.apiKeys }));
   app.route("/api", api);
 

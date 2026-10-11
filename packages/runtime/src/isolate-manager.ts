@@ -30,12 +30,16 @@ export interface InvokeInput {
   path: string;
   query?: Record<string, string>;
   headers?: Record<string, string>;
-  body?: string;
+  /** String for JSON API invokes; Uint8Array for raw public-ingress passthrough. */
+  body?: string | Uint8Array;
 }
 
 export interface InvokeResult {
   status: number;
-  body: string;
+  /** Raw response bytes (binary-safe). */
+  body: Uint8Array;
+  /** UTF-8 decoding of body (for JSON API consumers). */
+  bodyText: string;
   headers: Record<string, string>;
   metrics: { cpuMs: number; wallMs: number };
 }
@@ -211,7 +215,7 @@ export class IsolateManager {
         },
         body: input.body,
       } as unknown as Parameters<typeof isolate.mf.dispatchFetch>[1]);
-      const body = await response.text();
+      const body = new Uint8Array(await response.arrayBuffer());
 
       const headers: Record<string, string> = {};
       response.headers.forEach((value, key) => {
@@ -222,7 +226,13 @@ export class IsolateManager {
       this.metrics.requestsTotal.inc({ worker_id: input.workerId, status: String(response.status) });
       this.metrics.requestDuration.observe({ worker_id: input.workerId }, wallMs / 1000);
 
-      return { status: response.status, body, headers, metrics: { cpuMs: 0, wallMs } };
+      return {
+        status: response.status,
+        body,
+        bodyText: new TextDecoder().decode(body),
+        headers,
+        metrics: { cpuMs: 0, wallMs },
+      };
     } catch (error) {
       const isEgress = error instanceof Error && error.name === "EgressBlockedError";
       const isConcurrency = error instanceof Error && error.name === "ConcurrencyLimitError";

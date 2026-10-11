@@ -9,6 +9,8 @@ export interface RateLimitOptions {
   perMinute: number;
   /** Bucket capacity above the steady rate. */
   burst: number;
+  /** Evict untouched buckets above this count (memory safety). */
+  maxBuckets?: number;
 }
 
 interface Bucket {
@@ -16,12 +18,17 @@ interface Bucket {
   lastRefill: number;
 }
 
+const DEFAULT_MAX_BUCKETS = 10_000;
+/** Buckets untouched for this long are evictable. */
+const EVICT_AFTER_MS = 10 * 60_000;
+
 export class RateLimiter {
   private buckets = new Map<string, Bucket>();
 
   constructor(private readonly options: RateLimitOptions) {}
 
   check(key: string): { allowed: boolean; retryAfterSeconds: number } {
+    this.evictIfNeeded();
     const now = Date.now();
     const refillRate = this.options.perMinute / 60_000; // tokens per ms
 
@@ -46,9 +53,30 @@ export class RateLimiter {
     return { allowed: false, retryAfterSeconds: Math.ceil(tokensToNext / refillRate / 1000) };
   }
 
-  middleware(): (c: Context, next: Next) => Promise<Response | void> {
+  /**
+   * Lazy eviction: once the map exceeds maxBuckets, drop buckets idle past
+   * EVICT_AFTER_MS (an attacker sending unique keys cannot grow memory
+   * unboundedly; active buckets survive).
+   */
+  private evictIfNeeded(): void {
+    const max = this.options.maxBuckets ?? DEFAULT_MAX_BUCKETS;
+    if (this.buckets.size <= max) return;
+    const cutoff = Date.now() - EVICT_AFTER_MS;
+    for (const [key, bucket] of this.buckets) {
+      if (bucket.lastRefill < cutoff) this.buckets.delete(key);
+      if (this.buckets.size <= max / 2) break;
+    }
+  }
+
+  middleware(
+    getKey?: (c: Context) => string
+  ): (c: Context, next: Next) => Promise<Response | void> {
     return async (c, next) => {
-      const key = c.get("apiKeyId") as string | undefined ?? c.req.header("x-forwarded-for") ?? "anonymous";
+      const key =
+        getKey?.(c) ??
+        (c.get("apiKeyId") as string | undefined) ??
+        c.req.header("x-forwarded-for") ??
+        "anonymous";
       const { allowed, retryAfterSeconds } = this.check(key);
       if (!allowed) {
         c.header("Retry-After", String(retryAfterSeconds));

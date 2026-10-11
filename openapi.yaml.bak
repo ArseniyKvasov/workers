@@ -1,0 +1,829 @@
+openapi: 3.0.3
+info:
+  title: Workers Platform API
+  version: 1.0.0
+  description: |
+    Self-hosted workers platform. Management endpoints (`/api/*`) require `Authorization: Bearer <API_KEY>`.
+    Public worker ingress (`/w/<uuid>`) requires no auth; workers are addressed by their UUID id.
+    Domain configured via `.env` (`DOMAIN`).
+servers:
+  - url: https://workers.fastclass.ru
+    description: Production (nginx proxy + blue/green deploy)
+  - url: http://localhost:3000
+    description: Local dev
+security:
+  - BearerAuth: []
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    Worker:
+      type: object
+      required: []
+      properties:
+        id: { type: string, format: uuid, example: "a1b2c3d4-e5f6-..." }
+        runtime: { type: string, enum: [workerd@v1], default: workerd@v1 }
+        status: { type: string, enum: [active, paused], example: active }
+        limits:
+          type: object
+          properties:
+            cpu_ms: { type: integer, example: 5000 }
+            memory_mb: { type: integer, example: 128 }
+            concurrency: { type: integer, example: 100 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    Version:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        worker_id: { type: string, format: uuid }
+        code_hash: { type: string }
+        bundle_size: { type: integer }
+        created_at: { type: string, format: date-time }
+        promoted_at: { type: string, format: date-time }
+    WorkerCreate:
+      type: object
+      properties:
+        runtime: { type: string, enum: [workerd@v1], default: workerd@v1 }
+        limits:
+          type: object
+          properties:
+            cpu_ms: { type: integer, minimum: 50, maximum: 30000, default: 5000 }
+            memory_mb: { type: integer, minimum: 64, maximum: 1024, default: 128 }
+            concurrency: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+    WorkerUpdate:
+      type: object
+      properties:
+        status: { type: string, enum: [active, paused] }
+        limits:
+          type: object
+          properties:
+            cpu_ms: { type: integer, minimum: 50, maximum: 30000 }
+            memory_mb: { type: integer, minimum: 64, maximum: 1024 }
+            concurrency: { type: integer, minimum: 1, maximum: 1000 }
+    VersionPayload:
+      type: object
+      required: [code]
+      properties:
+        code: { type: string, description: "JavaScript or TypeScript source" }
+        manifest:
+          type: object
+          properties:
+            bindings:
+              type: object
+              properties:
+                d1_databases: { type: array, items: { type: string } }
+                kv_namespaces: { type: array, items: { type: string } }
+                queues: { type: array, items: { type: string } }
+                # secrets are declared implicitly via PUT /secrets
+            limits:
+              type: object
+              properties:
+                cpu_ms: { type: integer }
+                memory_mb: { type: integer }
+                concurrency: { type: integer }
+            entrypoint: { type: string, default: "src/index.ts" }
+            compatibility_date: { type: string, default: "2026-10-10" }
+            node_compat: { type: boolean, default: true }
+    SecretPayload:
+      type: object
+      description: "Keys are secret names; values are plaintext (encrypted server-side via AES-256-GCM)."
+      additionalProperties: { type: string }
+    InvokePayload:
+      type: object
+      properties:
+        method: { type: string, enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS], default: GET }
+        path: { type: string, default: "/" }
+        query: { type: object, additionalProperties: { type: string } }
+        headers: { type: object, additionalProperties: { type: string } }
+        body: { type: string }
+    D1Database:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        worker_id: { type: string, format: uuid }
+        name: { type: string }
+        size_bytes: { type: integer }
+        created_at: { type: string, format: date-time }
+    D1Create:
+      type: object
+      required: [worker_id, name]
+      properties:
+        worker_id: { type: string, minLength: 1 }
+        name: { type: string, minLength: 1, maxLength: 64, pattern: '^[a-zA-Z_][a-zA-Z0-9_]*$' }
+        schema_sql: { type: string, maxLength: 1048576 }
+    D1Query:
+      type: object
+      required: [sql]
+      properties:
+        sql: { type: string, minLength: 1, maxLength: 1048576 }
+        params:
+          type: array
+          items: { oneOf: [{ type: string }, { type: number }, { type: boolean }, { type: null }] }
+          maxItems: 100
+    D1Migrate:
+      type: object
+      required: [statements]
+      properties:
+        statements:
+          type: array
+          items: { type: string, minLength: 1, maxLength: 1048576 }
+          minItems: 1
+          maxItems: 200
+    KVNamespace:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        worker_id: { type: string, format: uuid }
+        name: { type: string }
+        key_count: { type: integer }
+        size_bytes: { type: integer }
+        created_at: { type: string, format: date-time }
+    KVCreate:
+      type: object
+      required: [worker_id, name]
+      properties:
+        worker_id: { type: string, minLength: 1 }
+        name: { type: string, minLength: 1, maxLength: 64, pattern: '^[a-zA-Z_][a-zA-Z0-9_]*$' }
+    KVBulkItem:
+      type: object
+      required: [key, value]
+      properties:
+        key: { type: string, minLength: 1, maxLength: 512 }
+        value: { type: string, maxLength: 1048576 }
+        ttl_seconds: { type: integer, minimum: 60, maximum: 31536000 }
+    KVBulk:
+      type: object
+      properties:
+        put:
+          type: array
+          items: { $ref: '#/components/schemas/KVBulkItem' }
+          maxItems: 10000
+        delete:
+          type: array
+          items: { type: string, minLength: 1, maxLength: 512 }
+          maxItems: 10000
+    Queue:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        worker_id: { type: string, format: uuid }
+        name: { type: string }
+        max_retries: { type: integer }
+        retention_seconds: { type: integer }
+        depth: { type: integer }
+        created_at: { type: string, format: date-time }
+    QueueCreate:
+      type: object
+      required: [worker_id, name]
+      properties:
+        worker_id: { type: string, minLength: 1 }
+        name: { type: string, minLength: 1, maxLength: 64, pattern: '^[a-zA-Z_][a-zA-Z0-9_]*$' }
+        max_retries: { type: integer, minimum: 0, maximum: 20, default: 3 }
+        retention_seconds: { type: integer, minimum: 60, maximum: 604800, default: 86400 }
+    QueuePush:
+      type: object
+      required: [body]
+      properties:
+        body: { type: string, minLength: 1, maxLength: 1048576 }
+    ApiKey:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        prefix: { type: string }
+        created_at: { type: string, format: date-time }
+        last_used_at: { type: string, format: date-time }
+        revoked_at: { type: string, format: date-time }
+    ApiKeyCreate:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 64 }
+    UsageSummary:
+      type: object
+      properties:
+        period:
+          type: object
+          properties:
+            from: { type: string, format: date-time }
+            to: { type: string, format: date-time }
+        summary:
+          type: object
+          properties:
+            requests_count: { type: integer }
+            errors_count: { type: integer }
+            cpu_ms_total: { type: integer }
+            memory_peak_bytes: { type: integer }
+            egress_bytes: { type: integer }
+            d1_rows_read: { type: integer }
+            d1_rows_written: { type: integer }
+            kv_ops: { type: integer }
+            queue_messages: { type: integer }
+    LogEntry:
+      type: object
+      properties:
+        ts: { type: string, format: date-time }
+        level: { type: string, enum: [debug, info, warn, error] }
+        msg: { type: string }
+        worker_id: { type: string, format: uuid }
+        version_id: { type: string, format: uuid }
+        request_id: { type: string, format: uuid }
+        fields:
+          type: object
+          additionalProperties: true
+paths:
+  /w/{id}:
+    get:
+      tags: [public-ingress]
+      summary: Public worker entrypoint (GET)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Worker response
+    post:
+      tags: [public-ingress]
+      summary: Public worker entrypoint (POST)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: false
+        content:
+          application/json: { schema: { type: object } }
+      responses:
+        '200':
+          description: Worker response
+  /api/workers:
+    post:
+      tags: [management]
+      summary: Create a new worker
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkerCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/Worker' }
+    get:
+      tags: [management]
+      summary: List workers
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+      responses:
+        '200':
+          description: List
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Worker' }
+  /api/workers/{id}:
+    get:
+      tags: [management]
+      summary: Worker details
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: Worker }
+    patch:
+      tags: [management]
+      summary: Update worker (e.g. limits, pause/resume)
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkerUpdate' }
+      responses:
+        '200': { description: Updated worker }
+    delete:
+      tags: [management]
+      summary: Delete worker
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: Deleted }
+  /api/workers/{id}/versions:
+    post:
+      tags: [management]
+      summary: Deploy a new version (code + manifest)
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VersionPayload' }
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                code: { type: string, format: binary }
+                manifest: { type: string }
+      responses:
+        '201': { description: Version created }
+    get:
+      tags: [management]
+      summary: Version history
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+      responses:
+        '200': { description: Versions list }
+  /api/workers/{id}/versions/{versionId}/promote:
+    post:
+      tags: [management]
+      summary: Promote version to production (hot reload)
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: versionId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: Promoted }
+  /api/workers/{id}/rollback:
+    post:
+      tags: [management]
+      summary: Rollback to previous promoted version
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: Rolled back }
+  /api/workers/{id}/invoke:
+    post:
+      tags: [management]
+      summary: Synchronous invoke (management API)
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InvokePayload' }
+      responses:
+        '200': { description: Invoke result }
+  /api/workers/{id}/usage:
+    get:
+      tags: [management]
+      summary: Usage analytics (requests, CPU, D1 rows, KV ops, queue messages)
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200': { description: Usage report }
+  /api/workers/{id}/logs:
+    get:
+      tags: [management]
+      summary: SSE log stream
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: SSE stream of logs }
+  /api/d1:
+    post:
+      tags: [management]
+      summary: Create D1 database (+ optional schema SQL)
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/D1Create' }
+      responses:
+        '201': { description: Created }
+    get:
+      tags: [management]
+      summary: List D1 databases for a worker
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: worker_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: List of D1 databases }
+  /api/d1/{workerId}/{name}/query:
+    post:
+      tags: [management]
+      summary: Execute SQL query on D1 database
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: workerId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/D1Query' }
+      responses:
+        '200': { description: Query result }
+  /api/d1/{workerId}/{name}/migrate:
+    post:
+      tags: [management]
+      summary: Apply migrations (if defined)
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: workerId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/D1Migrate' }
+      responses:
+        '200': { description: Migrated }
+  /api/d1/{workerId}/{name}/migrations:
+    get:
+      tags: [management]
+      summary: List applied migrations for a D1 database
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: workerId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Migrations list }
+  /api/d1/{workerId}/{name}:
+    delete:
+      tags: [management]
+      summary: Delete D1 database
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: workerId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Deleted }
+  /api/kv:
+    post:
+      tags: [management]
+      summary: Create KV namespace
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/KVCreate' }
+      responses:
+        '201': { description: Created }
+    get:
+      tags: [management]
+      summary: List KV namespaces for a worker
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: worker_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: List of KV namespaces }
+  /api/kv/{workerId}/{namespace}/bulk:
+    post:
+      tags: [management]
+      summary: Bulk put/delete KV keys (up to 10k)
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: workerId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: namespace
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/KVBulk' }
+      responses:
+        '200': { description: Bulk operation result }
+  /api/kv/{workerId}/{namespace}/keys:
+    get:
+      tags: [management]
+      summary: List KV keys (with prefix/cursor pagination)
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: workerId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: namespace
+          in: path
+          required: true
+          schema: { type: string }
+        - name: prefix
+          in: query
+          schema: { type: string }
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 100 }
+      responses:
+        '200': { description: Keys list }
+  /api/kv/{workerId}/{namespace}:
+    delete:
+      tags: [management]
+      summary: Delete KV namespace
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: workerId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: namespace
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Deleted }
+  /api/queues:
+    post:
+      tags: [management]
+      summary: Create queue
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QueueCreate' }
+      responses:
+        '201': { description: Created }
+    get:
+      tags: [management]
+      summary: List queues for a worker
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: worker_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: List of queues }
+  /api/queues/{workerId}/{queue}/messages:
+    post:
+      tags: [management]
+      summary: Push message to queue
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: workerId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: queue
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QueuePush' }
+      responses:
+        '201': { description: Pushed }
+  /api/queues/{workerId}/{queue}/metrics:
+    get:
+      tags: [management]
+      summary: Queue metrics (depth + DLQ)
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: workerId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: queue
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Metrics }
+  /api/queues/{workerId}/{queue}:
+    delete:
+      tags: [management]
+      summary: Delete queue
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: workerId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: queue
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Deleted }
+  /api/secrets:
+    put:
+      tags: [management]
+      summary: Upsert secrets (encrypted server-side)
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: worker_id
+          in: query
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SecretPayload' }
+      responses:
+        '200': { description: Updated }
+    get:
+      tags: [management]
+      summary: List secret names (values never returned)
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: worker_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Secret names list }
+    delete:
+      tags: [management]
+      summary: Delete a secret
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: worker_id
+          in: query
+          required: true
+          schema: { type: string }
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Deleted }
+  /api/api-keys:
+    post:
+      tags: [management]
+      summary: Create DB-stored API key (shown once in response)
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApiKeyCreate' }
+      responses:
+        '201':
+          description: Created (key shown once)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/ApiKey' }
+    get:
+      tags: [management]
+      summary: List API keys (metadata only)
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: List of API keys }
+    delete:
+      tags: [management]
+      summary: Revoke API key
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: Revoked }
+  /metrics:
+    get:
+      tags: [observability]
+      summary: Prometheus metrics
+      responses:
+        '200': { description: Text/plain metrics }
+  /health:
+    get:
+      tags: [observability]
+      summary: Liveness probe
+      responses:
+        '200': { description: OK }
+  /ready:
+    get:
+      tags: [observability]
+      summary: Readiness probe (postgres + redis + worker warm-up)
+      responses:
+        '200': { description: Ready }
+        '503': { description: Not ready }
+  /version:
+    get:
+      tags: [observability]
+      summary: Version info
+      responses:
+        '200':
+          description: Version
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: string }
+                  node: { type: string }

@@ -17,10 +17,14 @@ async function main() {
   try {
     await db.execute(sql`CREATE EXTENSION IF NOT EXISTS pgcrypto`);
 
+    // Legacy schema convergence: drop the removed worker name column/index.
+    await db.execute(sql`ALTER TABLE workers DROP COLUMN IF EXISTS name`);
+    await db.execute(sql`DROP INDEX IF EXISTS workers_name_uq`);
+
+    
     await db.execute(sql`
       CREATE TABLE IF NOT EXISTS workers (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        name TEXT NOT NULL,
         runtime TEXT NOT NULL DEFAULT 'workerd@v1',
         status TEXT NOT NULL DEFAULT 'active',
         limits JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -28,7 +32,6 @@ async function main() {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       )
     `);
-    await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS workers_name_uq ON workers (name)`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS workers_status_idx ON workers (status)`);
 
     await db.execute(sql`
@@ -180,6 +183,33 @@ async function main() {
     `);
     await db.execute(
       sql`CREATE UNIQUE INDEX IF NOT EXISTS usage_metrics_worker_bucket_idx ON usage_metrics (worker_id, bucket_start)`
+    );
+
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS cron_jobs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        worker_id UUID NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        schedule TEXT NOT NULL,
+        handler TEXT NOT NULL DEFAULT 'scheduled',
+        payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        next_run_at TIMESTAMPTZ,
+        last_run_at TIMESTAMPTZ,
+        last_run_status TEXT,
+        last_run_error TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await db.execute(
+      sql`CREATE UNIQUE INDEX IF NOT EXISTS cron_jobs_worker_name_uq ON cron_jobs (worker_id, name)`
+    );
+    await db.execute(
+      sql`CREATE INDEX IF NOT EXISTS cron_jobs_worker_idx ON cron_jobs (worker_id)`
+    );
+    await db.execute(
+      sql`CREATE INDEX IF NOT EXISTS cron_jobs_next_run_idx ON cron_jobs (next_run_at)`
     );
 
     console.log("Catalog schema is up to date");
