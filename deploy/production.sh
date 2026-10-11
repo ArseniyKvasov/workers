@@ -23,7 +23,6 @@ PREV_IMAGE_FILE="${SCRIPT_DIR}/.previous-image"
 BLUE_CONTAINER="workers-app-blue"
 GREEN_CONTAINER="workers-app-green"
 MAIN_CONTAINER="workers-app"
-NGINX_CONTAINER="workers-nginx"
 NETWORK="workers-network"
 
 log()  { printf '\033[1;34m[deploy]\033[0m %s\n' "$*" >&2; }
@@ -40,6 +39,7 @@ Environment:
   SKIP_BACKUP=1               skip S3 backup (dangerous; deploy refuses by default)
   NGINX_MANAGED_EXTERNALLY=1  do not touch nginx, only print the switch command
   HEALTH_TIMEOUT              seconds to wait for the new slot (default: 120)
+  NGINX_CONFIG_PATH           path to nginx site config (default: /etc/nginx/sites-available/workers-platform.conf)
 EOF
 }
 
@@ -157,7 +157,7 @@ apply_backup_retention() {
 }
 
 # ---------------------------------------------------------------------------
-# Nginx — просто рендер конфига и graceful reload
+# Nginx — write config to host and graceful reload
 # ---------------------------------------------------------------------------
 switch_nginx() {
   local target_slot="$1" template rendered active_container
@@ -170,14 +170,15 @@ switch_nginx() {
 
   if [[ "${NGINX_MANAGED_EXTERNALLY:-0}" == "1" ]]; then
     warn "NGINX_MANAGED_EXTERNALLY=1 — apply manually:"
-    warn "  install $rendered to /etc/nginx/sites-available/workers-platform.conf and reload nginx"
+    warn "  install $rendered to ${NGINX_CONFIG_PATH:-/etc/nginx/sites-available/workers-platform.conf} and reload nginx"
     return 0
   fi
 
-  # Копируем конфиг в nginx контейнер и делаем graceful reload
-  docker cp "$rendered" workers-nginx:/etc/nginx/templates/default.conf.template
-  docker exec workers-nginx nginx -t || die "nginx config test failed — keeping old config"
-  docker exec workers-nginx nginx -s reload || die "nginx reload failed"
+  # Write rendered config to host nginx site
+  local config_path="${NGINX_CONFIG_PATH:-/etc/nginx/sites-available/workers-platform.conf}"
+  sudo cp "$rendered" "$config_path"
+  sudo nginx -t || die "nginx config test failed — keeping old config"
+  sudo nginx -s reload || die "nginx reload failed"
   log "nginx: traffic switched to ${active_container} (${DOMAIN})"
 }
 

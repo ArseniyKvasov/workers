@@ -141,27 +141,6 @@ services:
       - workers-network
     restart: unless-stopped
 
-  # Nginx reverse proxy (started by deploy/production.sh)
-  nginx:
-    image: nginx:alpine
-    container_name: workers-nginx
-    profiles: ["nginx"]
-    ports:
-      - "${NGINX_HTTP_PORT:-8080}:80"
-      - "${NGINX_HTTPS_PORT:-8443}:443"
-    volumes:
-      - ./deploy/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
-      - ./certbot/conf:/etc/letsencrypt:ro
-      - ./certbot/www:/var/www/certbot:ro
-    environment:
-      - DOMAIN=${DOMAIN}
-      - ACTIVE_CONTAINER=workers-app
-    depends_on:
-      - app
-    networks:
-      - workers-network
-    restart: unless-stopped
-
 volumes:
   postgres-data:
   redis-data:
