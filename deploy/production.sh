@@ -157,28 +157,8 @@ apply_backup_retention() {
 }
 
 # ---------------------------------------------------------------------------
-# Nginx
+# Nginx — просто рендер конфига и graceful reload
 # ---------------------------------------------------------------------------
-ensure_nginx_running() {
-  if [[ "${NGINX_MANAGED_EXTERNALLY:-0}" == "1" ]]; then
-    return 0
-  fi
-  if ! docker ps --format '{{.Names}}' | grep -qx "workers-nginx"; then
-    log "starting nginx via docker compose profile"
-    docker compose --profile nginx up -d nginx
-    # wait for nginx to be ready
-    local waited=0
-    while (( waited < 30 )); do
-      if docker exec workers-nginx nginx -t >/dev/null 2>&1; then
-        return 0
-      fi
-      sleep 1
-      waited=$((waited + 1))
-    done
-    die "nginx failed to start"
-  fi
-}
-
 switch_nginx() {
   local target_slot="$1" template rendered active_container
   template="${SCRIPT_DIR}/nginx.conf.template"
@@ -194,8 +174,7 @@ switch_nginx() {
     return 0
   fi
 
-  ensure_nginx_running
-
+  # Копируем конфиг в nginx контейнер и делаем graceful reload
   docker cp "$rendered" workers-nginx:/etc/nginx/templates/default.conf.template
   docker exec workers-nginx nginx -t || die "nginx config test failed — keeping old config"
   docker exec workers-nginx nginx -s reload || die "nginx reload failed"
