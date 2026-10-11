@@ -17,6 +17,13 @@ server {
     listen 80;
     server_name __DOMAIN__;
 
+    # Let's Encrypt webroot — must stay outside the proxy so
+    # `certbot certonly --webroot` works (and renewals keep working).
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+        access_log off;
+    }
+
     # Workers public ingress + control plane API + health endpoints
     location / {
         proxy_pass http://workers_platform_app;
@@ -47,5 +54,10 @@ server {
     }
 }
 
-# TLS: run certbot --nginx -d <your-domain> or add a 443 server block
-# (same proxy_pass block as above, with your ssl_certificate paths).
+# TLS: appended automatically from nginx.tls-snippet.template when
+# /etc/letsencrypt/live/<domain>/fullchain.pem exists (see deploy script).
+# First-time issuance (run AFTER a deploy so the acme location above exists):
+#   mkdir -p /var/www/certbot
+#   certbot certonly --webroot -w /var/www/certbot -d <your-domain>
+#   ./deploy/production.sh   # picks up the cert, adds the 443 block
+# Renewals need nothing: webroot auth does not touch nginx config.

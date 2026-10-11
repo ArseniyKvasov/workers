@@ -76,6 +76,8 @@ Environment:
   NGINX_RELOAD_CMD            graceful reload command
                               (default: sudo nginx -s reload)
   NGINX_TEST_CMD              config test command (default: sudo nginx -t)
+  TLS_CERT_FILE / TLS_KEY_FILE  TLS cert paths (default: letsencrypt live dir
+                              for $DOMAIN; 443 block added only if both exist)
   PUBLIC_HEALTH_URL           probe through nginx after switch
                               (default: http://127.0.0.1/health)
   HEALTH_TIMEOUT              seconds to wait for the new slot (default: 180)
@@ -381,6 +383,30 @@ render_nginx_conf() {
     err "unreplaced placeholders left in rendered nginx conf:"
     grep -Eo '__[A-Z_]+__' "$RENDERED_FILE" | sort -u >&2 || true
     die "nginx template uses unknown placeholders (expected __DOMAIN__, __ACTIVE_PORT__)"
+  fi
+
+  # TLS: append the 443 block only when the cert already exists, so deploys
+  # neither reference missing files nor wipe a working TLS setup.
+  # (certbot --nginx would be wiped on the next deploy — use certonly --webroot.)
+  local cert="${TLS_CERT_FILE:-/etc/letsencrypt/live/${DOMAIN}/fullchain.pem}"
+  local key="${TLS_KEY_FILE:-/etc/letsencrypt/live/${DOMAIN}/privkey.pem}"
+  if [[ -f "$cert" && -f "$key" ]]; then
+    local snippet="${SCRIPT_DIR}/nginx.tls-snippet.template"
+    [[ -f "$snippet" ]] || die "nginx TLS snippet not found: $snippet"
+    local cert_escaped key_escaped
+    cert_escaped="$(printf '%s' "$cert" | sed -e 's/[\\/&|]/\\&/g')"
+    key_escaped="$(printf '%s' "$key" | sed -e 's/[\\/&|]/\\&/g')"
+    sed -e "s|__DOMAIN__|${domain_escaped}|g" \
+        -e "s|__ACTIVE_PORT__|${active_port}|g" \
+        -e "s|__TLS_CERT__|${cert_escaped}|g" \
+        -e "s|__TLS_KEY__|${key_escaped}|g" \
+        "$snippet" >> "$RENDERED_FILE"
+    if grep -vE '^[[:space:]]*#' "$RENDERED_FILE" | grep -Eq '__[A-Z_]+__'; then
+      die "unreplaced placeholders left in TLS snippet"
+    fi
+    log "nginx: TLS enabled for ${DOMAIN} (443)"
+  else
+    log "nginx: no cert at ${cert} — serving plain HTTP on 80"
   fi
   log "nginx: rendered site conf for slot ${target_slot} (127.0.0.1:${active_port})"
 }
