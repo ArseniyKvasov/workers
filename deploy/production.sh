@@ -244,6 +244,20 @@ preflight() {
       err "preflight FAIL: cannot write $cfg and passwordless sudo unavailable"
       failures=$((failures + 1))
     fi
+    # Best-effort: is our site actually loaded by nginx? A missing
+    # sites-enabled symlink means nginx serves the default server (404)
+    # even though the deploy flow itself succeeds up to the public probe.
+    local effective
+    effective="$(nginx -T 2>/dev/null || sudo nginx -T 2>/dev/null || true)"
+    if [[ -z "${effective:-}" ]]; then
+      warn "preflight: cannot dump effective nginx config (nginx -T failed) — skipping site check"
+    elif ! grep -q "workers_platform_app" <<<"$effective"; then
+      err "preflight FAIL: nginx does not load our site (no workers_platform_app upstream) — symlink it:"
+      err "  ln -s $cfg /etc/nginx/sites-enabled/workers-platform.conf && nginx -t && nginx -s reload"
+      failures=$((failures + 1))
+    else
+      log "preflight ok: nginx loads our site conf"
+    fi
   fi
 
   # Free disk (images + pg dump need room).
