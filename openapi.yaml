@@ -1,0 +1,447 @@
+openapi: 3.0.3
+info:
+  title: Workers Platform API
+  version: 1.0.0
+  description: |
+    Self-hosted workers platform. Management endpoints (`/api/*`) require `Authorization: Bearer <API_KEY>`.
+    Public worker ingress (`/w/<name>`) requires no auth. Domain configured via `.env` (`DOMAIN`).
+servers:
+  - url: https://workers.fastclass.ru
+    description: Production (nginx proxy + blue/green deploy)
+  - url: http://localhost:3000
+    description: Local dev
+security:
+  - BearerAuth: []
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT-like (platform uses static `wpk_...` or DB-generated keys)
+  schemas:
+    Worker:
+      type: object
+      required: [name]
+      properties:
+        id: { type: string, format: uuid, example: "a1b2c3d4-e5f6-..." }
+        name: { type: string, example: "my-worker" }
+        status: { type: string, enum: [active, inactive], example: "active" }
+        limits:
+          type: object
+          properties:
+            cpu_ms: { type: integer, example: 5000 }
+            memory_mb: { type: integer, example: 128 }
+            concurrency: { type: integer, example: 100 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    VersionPayload:
+      type: object
+      required: [code]
+      properties:
+        code: { type: string, description: "JavaScript source" }
+        manifest:
+          type: object
+          properties:
+            bindings:
+              type: object
+              properties:
+                d1_databases: { type: array, items: { type: string } }
+                kv_namespaces: { type: array, items: { type: string } }
+                queues: { type: array, items: { type: string } }
+    SecretPayload:
+      type: object
+      description: "Keys are secret names; values are plaintext (encrypted server-side via AES-256-GCM)."
+      additionalProperties: { type: string }
+    InvokePayload:
+      type: object
+      properties:
+        method: { type: string, example: "GET" }
+        path: { type: string, example: "/" }
+        body: { type: string }
+paths:
+  # Public ingress — no auth
+  /w/{name}:
+    get:
+      tags: [public-ingress]
+      summary: "Public worker entrypoint (GET)"
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: "Worker response" }
+    post:
+      tags: [public-ingress]
+      summary: "Public worker entrypoint (POST)"
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json: { schema: { type: object } }
+      responses:
+        '200': { description: "Worker response" }
+
+  # Management API — auth required
+  /api/workers:
+    post:
+      tags: [management]
+      summary: "Create a new worker"
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Worker' }
+      responses:
+        '201':
+          description: "Created"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/Worker' }
+    get:
+      tags: [management]
+      summary: "List workers"
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+      responses:
+        '200':
+          description: "List"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Worker' } }
+
+  /api/workers/{id}:
+    get:
+      tags: [management]
+      summary: "Worker details"
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: "Worker" }
+    patch:
+      tags: [management]
+      summary: "Update worker (e.g. limits)"
+      security: [{ BearerAuth: [] }]
+    delete:
+      tags: [management]
+      summary: "Delete worker"
+      security: [{ BearerAuth: [] }]
+
+  /api/workers/{id}/versions:
+    post:
+      tags: [management]
+      summary: "Deploy a new version (code + manifest)"
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VersionPayload' }
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                code: { type: string, format: binary }
+                manifest: { type: string }
+      responses:
+        '201': { description: "Version created" }
+    get:
+      tags: [management]
+      summary: "Version history"
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: "Versions list" }
+
+  /api/workers/{id}/versions/{versionId}/promote:
+    post:
+      tags: [management]
+      summary: "Promote version to production (hot reload)"
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: "Promoted" }
+
+  /api/workers/{id}/rollback:
+    post:
+      tags: [management]
+      summary: "Rollback to previous promoted version"
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: "Rolled back" }
+
+  /api/workers/{id}/invoke:
+    post:
+      tags: [management]
+      summary: "Synchronous invoke (management API)"
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InvokePayload' }
+      responses:
+        '200': { description: "Invoke result" }
+
+  /api/workers/{id}/usage:
+    get:
+      tags: [management]
+      summary: "Usage analytics (requests, CPU, D1 rows, KV ops)"
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200': { description: "Usage report" }
+
+  /api/workers/{id}/logs:
+    get:
+      tags: [management]
+      summary: "SSE log stream"
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: "SSE stream of logs" }
+
+  /api/d1:
+    post:
+      tags: [management]
+      summary: "Create D1 database (+ optional schema SQL)"
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                worker_id: { type: string }
+                name: { type: string }
+                schema_sql: { type: string }
+      responses:
+        '201': { description: "Created" }
+
+  /api/d1/{workerId}/{name}/query:
+    post:
+      tags: [management]
+      summary: "Execute SQL query on D1 database"
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                sql: { type: string }
+      responses:
+        '200': { description: "Query result" }
+
+  /api/d1/{workerId}/{name}/migrate:
+    post:
+      tags: [management]
+      summary: "Apply migrations (if defined)"
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: "Migrated" }
+
+  /api/kv:
+    post:
+      tags: [management]
+      summary: "Create KV namespace"
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                worker_id: { type: string }
+                name: { type: string }
+      responses:
+        '201': { description: "Created" }
+
+  /api/kv/{workerId}/{ns}/bulk:
+    post:
+      tags: [management]
+      summary: "Bulk put/delete KV keys (up to 10k)"
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200': { description: "Bulk operation result" }
+
+  /api/kv/{workerId}/{ns}/keys:
+    get:
+      tags: [management]
+      summary: "List KV keys (with prefix/cursor pagination)"
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: prefix
+          in: query
+          schema: { type: string }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        '200': { description: "Keys list" }
+
+  /api/queues:
+    post:
+      tags: [management]
+      summary: "Create queue"
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                worker_id: { type: string }
+                name: { type: string }
+      responses:
+        '201': { description: "Created" }
+
+  /api/queues/{workerId}/{q}/messages:
+    post:
+      tags: [management]
+      summary: "Push message to queue"
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                payload: { type: object }
+      responses:
+        '201': { description: "Pushed" }
+
+  /api/queues/{workerId}/{q}/metrics:
+    get:
+      tags: [management]
+      summary: "Queue metrics (depth + DLQ)"
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: "Metrics" }
+
+  /api/secrets:
+    put:
+      tags: [management]
+      summary: "Upsert secrets (encrypted server-side)"
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: worker_id
+          in: query
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SecretPayload' }
+      responses:
+        '200': { description: "Updated" }
+    get:
+      tags: [management]
+      summary: "List secret names (values never returned)"
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: worker_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: "Secret names list" }
+
+  /api/api-keys:
+    post:
+      tags: [management]
+      summary: "Create DB-stored API key (shown once in response)"
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, example: "deploy-key" }
+      responses:
+        '201':
+          description: "Created (key shown once)"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: object, properties: { key: { type: string } } }
+
+  /metrics:
+    get:
+      tags: [observability]
+      summary: "Prometheus metrics"
+      responses:
+        '200': { description: "Text/plain metrics" }
+
+  /health:
+    get:
+      tags: [observability]
+      summary: "Liveness probe"
+      responses:
+        '200': { description: "OK" }
+
+  /ready:
+    get:
+      tags: [observability]
+      summary: "Readiness probe (postgres + redis + worker warm-up)"
+      responses:
+        '200': { description: "Ready" }
+        '503': { description: "Not ready" }
+
+  /version:
+    get:
+      tags: [observability]
+      summary: "Version info"
+      responses:
+        '200':
+          description: "Version"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: string }
+                  node: { type: string }
