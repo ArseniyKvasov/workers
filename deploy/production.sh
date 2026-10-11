@@ -442,14 +442,29 @@ test_nginx_conf() {
     echo "$output" | tail -n 5 >&2 || true
     log "nginx: config test passed"
   else
+    # Print exact nginx error before rollback so user knows the cause
+    # (e.g. broken TLS snippet, missing cert path, syntax error).
+    local error_full="${output:-(no nginx output)}"
+    err "nginx config test FAILED — exact error:"
+    echo "$error_full" | sed 's/^/  /' >&2 || true
+    # Show which file was tested (site conf or snippet) for faster debug.
+    local tls_cert_path="${TLS_CERT_FILE:-/etc/letsencrypt/live/${DOMAIN}/fullchain.pem}"
+    local tls_key_path="${TLS_KEY_FILE:-/etc/letsencrypt/live/${DOMAIN}/privkey.pem}"
+    if grep -q "listen 443 ssl" "$RENDERED_FILE" 2>/dev/null; then
+      err "  TLS snippet (443) included; cert=${tls_cert_path}; key=${tls_key_path}; snippet file=${SCRIPT_DIR}/nginx.tls-snippet.template"
+    else
+      err "  TLS snippet NOT included (443 missing); check site conf syntax or upstream definition."
+      err "  Rendered conf: $RENDERED_FILE"
+    fi
+
     # Restore previous site conf so a bad render can never break nginx.
     local config_path="${NGINX_CONFIG_PATH:-/etc/nginx/sites-available/workers-platform.conf}"
     if [[ -f "${RENDERED_FILE}.prev" ]]; then
-      warn "restoring previous site conf"
+      warn "restoring previous site conf from ${RENDERED_FILE}.prev"
       if [[ -w "$config_path" ]]; then cp "${RENDERED_FILE}.prev" "$config_path"
       elif command -v sudo >/dev/null 2>&1; then sudo cp "${RENDERED_FILE}.prev" "$config_path"; fi
     fi
-    die "nginx config test failed — old slot still serving, deploy aborted"
+    die "nginx config test failed — old slot (${STATE_FILE:-unknown}) still serving, deploy aborted"
   fi
 }
 
