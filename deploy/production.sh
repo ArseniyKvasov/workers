@@ -16,7 +16,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-ENV_FILE="${ENV_FILE:-${SCRIPT_DIR}/.env.production}"
+ENV_FILE="${ENV_FILE:-${ROOT_DIR}/.env}"
 STATE_FILE="${SCRIPT_DIR}/.active-slot"
 PREV_IMAGE_FILE="${SCRIPT_DIR}/.previous-image"
 
@@ -36,7 +36,7 @@ usage() {
 Usage: $0 [deploy|status|rollback]
 
 Environment:
-  ENV_FILE                    env file to load (default: deploy/.env.production)
+  ENV_FILE                    env file to load (default: .env in project root)
   SKIP_BACKUP=1               skip S3 backup (dangerous; deploy refuses by default)
   NGINX_MANAGED_EXTERNALLY=1  do not touch nginx, only print the switch command
   HEALTH_TIMEOUT              seconds to wait for the new slot (default: 120)
@@ -48,7 +48,7 @@ EOF
 # ---------------------------------------------------------------------------
 load_env() {
   if [[ ! -f "$ENV_FILE" ]]; then
-    die "env file not found: $ENV_FILE (copy deploy/.env.production.example)"
+    die "env file not found: $ENV_FILE (copy .env.example to .env and configure)"
   fi
   local tmp_env
   tmp_env="$(mktemp)"
