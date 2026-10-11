@@ -20,8 +20,11 @@ ENV_FILE="${ENV_FILE:-${SCRIPT_DIR}/.env.production}"
 STATE_FILE="${SCRIPT_DIR}/.active-slot"
 PREV_IMAGE_FILE="${SCRIPT_DIR}/.previous-image"
 
-BLUE_CONTAINER="workers-platform-blue"
-GREEN_CONTAINER="workers-platform-green"
+BLUE_CONTAINER="workers-app-blue"
+GREEN_CONTAINER="workers-app-green"
+MAIN_CONTAINER="workers-app"
+NGINX_CONTAINER="workers-nginx"
+NETWORK="workers-network"
 
 log()  { printf '\033[1;34m[deploy]\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[1;33m[deploy]\033[0m %s\n' "$*" >&2; }
@@ -47,8 +50,7 @@ load_env() {
   if [[ ! -f "$ENV_FILE" ]]; then
     die "env file not found: $ENV_FILE (copy deploy/.env.production.example)"
   fi
-  # Export KEY=VALUE lines via a temp file (process substitution is flaky
-  # in some sandboxed shells).
+  # Export KEY=VALUE lines via temp file (process substitution is flaky in some shells)
   local tmp_env
   tmp_env="$(mktemp)"
   grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_FILE" > "$tmp_env"
@@ -69,25 +71,27 @@ require_env() {
 # ---------------------------------------------------------------------------
 # Slot helpers
 # ---------------------------------------------------------------------------
-container_for_slot() { case "$1" in blue) echo "$BLUE_CONTAINER" ;; green) echo "$GREEN_CONTAINER" ;; esac; }
-port_for_slot()      { case "$1" in blue) echo "$BLUE_PORT"   ;; green) echo "$GREEN_PORT"   ;; esac; }
+container_for_slot() { case "$1" in blue) echo "workers-app-blue" ;; green) echo "workers-app-green" ;; esac; }
+port_for_slot()      { case "$1" in blue) echo "3100" ;; green) echo "3200" ;; esac; }
 
 slot_is_healthy() {
-  local port="$1"
-  curl -fsS -m 3 "http://127.0.0.1:${port}/ready" 2>/dev/null | grep -q '"healthy":true'
+  local container="$1"
+  docker exec "$container" node -e "fetch('http://localhost:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1
 }
 
 active_slot() {
-  # Trust the state file when it matches reality; otherwise probe health.
-  local from_state="${2:-}"
+  local from_state="${1:-}"
   if [[ -f "$STATE_FILE" && -z "$from_state" ]]; then
     from_state="$(cat "$STATE_FILE")"
   fi
   case "$from_state" in
     blue|green) echo "$from_state"; return 0 ;;
   esac
-  if slot_is_healthy "$BLUE_PORT" && ! slot_is_healthy "$GREEN_PORT"; then echo blue
-  elif slot_is_healthy "$GREEN_PORT" && ! slot_is_healthy "$BLUE_PORT"; then echo green
+  local blue_healthy green_healthy
+  blue_healthy=$(docker exec workers-app-blue node -e "fetch('http://localhost:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1 && echo true || echo false)
+  green_healthy=$(docker exec workers-app-green node -e "fetch('http://localhost:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1 && echo true || echo false)
+  if [[ "$blue_healthy" == "true" && "$green_healthy" == "false" ]]; then echo blue
+  elif [[ "$green_healthy" == "true" && "$blue_healthy" == "false" ]]; then echo green
   else
     return 1
   fi
@@ -99,14 +103,7 @@ active_slot() {
 timestamp() { date -u +"%Y%m%dT%H%M%SZ"; }
 
 run_pg_dump() {
-  # Prefer host pg_dump; fall back to a throwaway postgres container
-  # (--network host so DATABASE_URL with localhost keeps working).
-  if command -v pg_dump > /dev/null 2>&1; then
-    pg_dump --no-owner --no-privileges "$DATABASE_URL"
-  else
-    docker run --rm --network host postgres:16-alpine \
-      pg_dump --no-owner --no-privileges "$DATABASE_URL"
-  fi
+  docker exec workers-postgres pg_dump --no-owner --no-privileges -U "${POSTGRES_USER:-postgres}" "${POSTGRES_DB:-workers_platform}"
 }
 
 do_backup() {
@@ -130,9 +127,9 @@ do_backup() {
     warn "postgres backup FAILED"
   fi
 
-  log "backup: data dir (${DATA_DIR_HOST}) -> ${backup_prefix}/data.tgz"
-  if tar -czf - -C "$(dirname "$DATA_DIR_HOST")" "$(basename "$DATA_DIR_HOST")" 2>/dev/null \
-      | aws s3 cp - "${backup_prefix}/data.tgz" \
+  log "backup: data dir -> ${backup_prefix}/data.tgz"
+  if docker run --rm -v workers-data:/data -v "$(pwd):/backup" alpine \
+      tar -czf - -C /data . | aws s3 cp - "${backup_prefix}/data.tgz" \
         ${S3_ENDPOINT:+--endpoint-url "$S3_ENDPOINT"}; then
     data_ok=1
   else
@@ -151,7 +148,7 @@ apply_backup_retention() {
   [[ "$keep" =~ ^[0-9]+$ ]] || keep=14
   local ep=(); [[ -n "${S3_ENDPOINT:-}" ]] && ep=(--endpoint-url "$S3_ENDPOINT")
 
-  # Delete the oldest backups beyond the retention window (name sort = time sort).
+  # Delete the oldest backups beyond the retention window
   aws s3 ls "s3://${S3_BACKUP_BUCKET}/${S3_BACKUP_PREFIX}/" "${ep[@]}" 2>/dev/null \
     | awk '{print $NF}' | grep -E '^[0-9]{8}T[0-9]{6}Z$' | sort -r \
     | tail -n +$((keep + 1)) \
@@ -165,82 +162,29 @@ apply_backup_retention() {
 # Nginx
 # ---------------------------------------------------------------------------
 switch_nginx() {
-  local port="$1" template rendered
+  local target_slot="$1" template rendered active_container
   template="${SCRIPT_DIR}/nginx.conf.template"
   rendered="${SCRIPT_DIR}/nginx.conf.rendered"
   [[ -f "$template" ]] || die "nginx template not found: $template"
 
-  sed -e "s/__DOMAIN__/${DOMAIN}/g" -e "s/__ACTIVE_PORT__/${port}/g" "$template" > "$rendered"
+  active_container="workers-app-${target_slot}"
+  sed -e "s/__DOMAIN__/${DOMAIN}/g" -e "s/__ACTIVE_CONTAINER__/${active_container}/g" "$template" > "$rendered"
 
   if [[ "${NGINX_MANAGED_EXTERNALLY:-0}" == "1" ]]; then
     warn "NGINX_MANAGED_EXTERNALLY=1 — apply manually:"
-    warn "  install $rendered to $NGINX_CONFIG_PATH and reload nginx"
+    warn "  install $rendered to /etc/nginx/sites-available/workers-platform.conf and reload nginx"
     return 0
   fi
-  command -v nginx > /dev/null 2>&1 || die "nginx not found (or set NGINX_MANAGED_EXTERNALLY=1)"
 
-  sudo install -m 644 "$rendered" "$NGINX_CONFIG_PATH"
-  sudo nginx -t || die "nginx config test failed — keeping old config"
-  sudo nginx -s reload || sudo systemctl reload nginx || die "nginx reload failed"
-  log "nginx: traffic switched to port ${port} (${DOMAIN})"
+  docker cp "$rendered" workers-nginx:/etc/nginx/templates/default.conf.template
+  docker exec workers-nginx nginx -t || die "nginx config test failed — keeping old config"
+  docker exec workers-nginx nginx -s reload || die "nginx reload failed"
+  log "nginx: traffic switched to port ${active_port} (${DOMAIN})"
 }
 
 # ---------------------------------------------------------------------------
 # Docker slot management
 # ---------------------------------------------------------------------------
-start_slot() {
-  local slot="$1" image="$2" container port
-  container="$(container_for_slot "$slot")"
-  port="$(port_for_slot "$slot")"
-
-  docker rm -f "$container" > /dev/null 2>&1 || true
-  log "starting ${container} (image ${image}, port ${port})"
-
-  docker run -d --name "$container" \
-    --network host \
-    --restart unless-stopped \
-    -e PORT="$port" \
-    -e NODE_ENV=production \
-    -e DATABASE_URL="$DATABASE_URL" \
-    -e REDIS_URL="$REDIS_URL" \
-    -e SECRETS_MASTER_KEY="$SECRETS_MASTER_KEY" \
-    -e API_KEY="${API_KEY:-}" \
-    -e DATA_DIR=/data \
-    -e LOG_LEVEL="${LOG_LEVEL:-info}" \
-    -v "${DATA_DIR_HOST}:/data" \
-    --memory "${CONTAINER_MEMORY:-2g}" \
-    --cpus "${CONTAINER_CPUS:-2}" \
-    "$image" > /dev/null
-}
-
-stop_slot() {
-  local slot="$1" container
-  container="$(container_for_slot "$slot")"
-  if docker ps --format '{{.Names}}' | grep -qx "$container"; then
-    log "stopping ${container} (${2:-old slot})"
-    docker stop -t 35 "$container" > /dev/null
-  fi
-  docker rm -f "$container" > /dev/null 2>&1 || true
-}
-
-wait_healthy() {
-  local slot="$1" timeout="${HEALTH_TIMEOUT:-120}" port waited=0
-  port="$(port_for_slot "$slot")"
-
-  while (( waited < timeout )); do
-    if slot_is_healthy "$port"; then
-      log "slot ${slot} is healthy on port ${port} (after ${waited}s, warm-up complete)"
-      return 0
-    fi
-    sleep 3
-    waited=$((waited + 3))
-  done
-  warn "last /ready response on port ${port}:"
-  curl -sS -m 3 "http://127.0.0.1:${port}/ready" 2>&1 | head -c 500 || true
-  echo
-  return 1
-}
-
 build_image() {
   local tag="${IMAGE_NAME:-workers-platform}"
   local version
@@ -251,6 +195,65 @@ build_image() {
   echo "$tag"
 }
 
+start_slot() {
+  local slot="$1" image="$2" container port
+  container="workers-app-${slot}"
+  port=$([[ "$slot" == "blue" ]] && echo 3100 || echo 3200)
+
+  docker rm -f "$container" > /dev/null 2>&1 || true
+  log "starting ${container} (image ${image}, port ${port})"
+
+  docker run -d --name "$container" \
+    --network workers-network \
+    --restart unless-stopped \
+    -e PORT=3000 \
+    -e NODE_ENV=production \
+    -e DATABASE_URL="postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-workers_platform}" \
+    -e REDIS_URL=redis://redis:6379 \
+    -e SECRETS_MASTER_KEY="${SECRETS_MASTER_KEY}" \
+    -e API_KEY="${API_KEY}" \
+    -e DOMAIN="${DOMAIN}" \
+    -e BLUE_PORT=3100 \
+    -e GREEN_PORT=3200 \
+    -e DATA_DIR=/data \
+    -e EGRESS_ALLOWED_DOMAINS="${EGRESS_ALLOWED_DOMAINS}" \
+    -e LOG_LEVEL="${LOG_LEVEL:-info}" \
+    -e RUNTIME_LOG_LEVEL="${RUNTIME_LOG_LEVEL:-warn}" \
+    -e SERVICE_NAME=workers-platform \
+    -v workers-data:/data \
+    --memory "${CONTAINER_MEMORY:-2g}" \
+    --cpus "${CONTAINER_CPUS:-2}" \
+    "$image" > /dev/null
+}
+
+stop_slot() {
+  local slot="$1" container
+  container="workers-app-${slot}"
+  if docker ps --format '{{.Names}}' | grep -qx "$container"; then
+    log "stopping ${container} (${2:-old slot})"
+    docker stop -t 35 "$container" > /dev/null
+  fi
+  docker rm -f "$container" > /dev/null 2>&1 || true
+}
+
+wait_healthy() {
+  local slot="$1" timeout="${HEALTH_TIMEOUT:-120}" waited=0
+  local container="workers-app-${slot}"
+
+  while (( waited < timeout )); do
+    if docker exec "$container" node -e "fetch('http://localhost:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; then
+      log "slot ${slot} is healthy (after ${waited}s, warm-up complete)"
+      return 0
+    fi
+    sleep 3
+    waited=$((waited + 3))
+  done
+  warn "last /ready response from ${container}:"
+  docker exec "$container" node -e "fetch('http://localhost:3000/ready').then(r=>console.log(r.status, r.ok)).catch(e=>console.error(e))" 2>&1 | head -c 500 || true
+  echo
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -258,8 +261,8 @@ cmd_deploy() {
   local incoming_image="${1:-}"
 
   require_env DOMAIN; require_env BLUE_PORT; require_env GREEN_PORT
-  require_env DATABASE_URL; require_env REDIS_URL; require_env SECRETS_MASTER_KEY
-  require_env DATA_DIR_HOST
+  require_env POSTGRES_USER; require_env POSTGRES_PASSWORD; require_env POSTGRES_DB
+  require_env SECRETS_MASTER_KEY; require_env API_KEY; require_env DOMAIN
 
   local active target
   if ! active="$(active_slot)"; then
@@ -270,7 +273,7 @@ cmd_deploy() {
   if [[ -n "$active" ]]; then
     target="$( [[ "$active" == "blue" ]] && echo green || echo blue )"
   else
-    target="blue"   # first deploy
+    target="blue"
   fi
 
   log "active slot: ${active:-none}, deploying into: $target"
@@ -291,13 +294,11 @@ cmd_deploy() {
     die "deploy aborted; ${active:-none} slot untouched"
   fi
 
-  switch_nginx "$(port_for_slot "$target")"
+  switch_nginx "$target"
 
-  # Verify the public entrypoint through nginx before removing the old slot.
-  local probe_port
-  probe_port="$(port_for_slot "$target")"
+  # Verify through nginx
   if [[ "${NGINX_MANAGED_EXTERNALLY:-0}" != "1" ]]; then
-    if curl -fsS -m 10 "http://127.0.0.1:${probe_port}/health" > /dev/null 2>&1; then
+    if curl -fsS -m 10 "http://localhost/health" > /dev/null 2>&1; then
       log "public health probe OK"
     else
       warn "public health probe failed — old slot kept, check nginx"
@@ -306,13 +307,11 @@ cmd_deploy() {
   fi
 
   if [[ -n "$active" ]]; then
-    # Remember what was running for `rollback`, then retire the old slot.
-    docker inspect --format '{{.Config.Image}}' "$(container_for_slot "$active")" \
-      > "$PREV_IMAGE_FILE" 2>/dev/null || true
+    docker inspect --format '{{.Config.Image}}' "workers-app-${active}" > "${PREV_IMAGE_FILE}" 2>/dev/null || true
     stop_slot "$active"
   fi
 
-  echo "$target" > "$STATE_FILE"
+  echo "$target" > "${STATE_FILE}"
   log "deploy complete: slot=${target} image=${image}"
   log "workers were warmed up from the catalog before the traffic switch (zero downtime)"
 }
@@ -333,15 +332,17 @@ cmd_rollback() {
 }
 
 cmd_status() {
-  local active
   echo "== slots =="
   for slot in blue green; do
-    local port container running health
-    port="$(port_for_slot "$slot" 2>/dev/null || echo '?')"
-    container="$(container_for_slot "$slot")"
-    running="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$container" && echo yes || echo no)"
-    if [[ "$port" != "?" ]] && slot_is_healthy "$port"; then health=healthy; else health=unhealthy; fi
-    printf '  %-5s port=%-6s container=%-24s running=%-3s health=%s\n' "$slot" "$port" "$container" "$running" "$health"
+    local container="workers-app-${slot}"
+    local running health
+    running=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$container" && echo yes || echo no)
+    if docker exec "$container" node -e "fetch('http://localhost:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; then
+      health=healthy
+    else
+      health=unhealthy
+    fi
+    printf '  %-5s container=%-20s running=%-3s health=%s\n' "$slot" "$container" "$running" "$health"
   done
   if [[ -f "$STATE_FILE" ]]; then
     echo "active slot: $(cat "$STATE_FILE")"

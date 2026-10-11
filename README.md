@@ -186,31 +186,125 @@ pnpm test             # bindings (D1 локально, Redis при наличи
 pnpm --filter @platform/control-plane dev
 ```
 
-## Production deploy (blue/green, zero downtime)
+## Production deploy (Docker, blue/green, zero downtime)
 
-`deploy/production.sh` разворачивает платформу на сервере в два слота (blue/green):
+### Быстрый старт на сервере
 
+```bash
+# 1. Клонируй репозиторий
+git clone https://github.com/ArseniyKvasov/workers.git
+cd workers
+
+# 2. Настрой .env (скопируй и заполни)
+cp .env.example .env
+# Отредактируй .env: заполни SECRETS_MASTER_KEY, API_KEY, DOMAIN, S3_* и т.д.
+
+# 3. Запусти инфраструктуру (Postgres, Redis, App, Nginx)
+docker compose up -d
+
+# 4. Создай папку для D1 данных
+sudo mkdir -p /var/lib/workers-platform
+sudo chown -R 1000:1000 /var/lib/workers-platform
+
+# 5. Миграции БД
+docker compose exec app node --require dotenv/config packages/catalog/dist/migrate-cli.js
+# или локально: DATABASE_URL=postgresql://postgres:postgres@localhost:5432/workers_platform pnpm db:migrate
+
+# 6. Создай первый API ключ (bootstrap)
+docker compose exec app node --require dotenv/config -e "
+const { generateApiKey } = require('./packages/api/dist/auth.js');
+const { createCatalogDb } = require('./packages/catalog/dist/client.js');
+const { ApiKeysRepository } = require('./packages/catalog/dist/repositories2.js');
+const { db } = createCatalogDb({ databaseUrl: process.env.DATABASE_URL });
+const repo = new ApiKeysRepository(db);
+const { key } = generateApiKey();
+repo.create({ name: 'initial', prefix: key.split('_')[1], hash: require('crypto').createHash('sha256').update(key).digest('hex') });
+console.log('API_KEY:', key);
+"
 ```
-./deploy/production.sh deploy     # бэкап -> build -> новый слот -> health check ->
-                                  # switch nginx -> стоп старого слота
-./deploy/production.sh status     # состояние слотов, контейнеров, health
-./deploy/production.sh rollback   # передеплой предыдущего образа тем же флоу
+
+### Проверка работы
+
+```bash
+# Health checks
+curl http://localhost:3000/health
+curl http://localhost:3000/ready
+
+# Публичный ingress воркера (без auth)
+curl -X POST http://localhost:3000/w/my-worker -d '{"action":"test"}'
+
+# Management API (требует API_KEY из .env)
+curl -H "Authorization: Bearer $API_KEY" http://localhost:3000/api/workers
 ```
 
-Как обеспечивается zero downtime:
-1. **Бэкап в S3 в начале деплоя** (pg_dump каталога + tar D1-данных). Если бэкап не удался — деплой прерывается.
-2. Новый контейнер стартует на **свободном слоте** (PORT=$BLUE_PORT или $GREEN_PORT, `--network host`), nginx продолжает слать трафик в активный.
-3. Скрипт ждёт `/ready` (up to `HEALTH_TIMEOUT`): сервер слушает порт только **после** warm-up, т.е. все воркеры восстановлены из каталога. Health check не прошёл → новый слот удаляется, старый не тронут.
-4. nginx переключается рендером `deploy/nginx.conf.template` (`__DOMAIN__`, `__ACTIVE_PORT__`) + `nginx -t` + reload (без рестарта соединений).
+### Blue/Green Deploy (zero downtime)
+
+```bash
+# Настрой deploy env
+cp deploy/.env.production.example deploy/.env.production
+# Заполни: DOMAIN, BLUE_PORT=3100, GREEN_PORT=3200, S3_* ключи, POSTGRES_* и т.д.
+
+# Статус
+./deploy/production.sh status
+
+# Деплой (бэкап в S3 -> build -> новый слот -> health -> nginx switch -> stop old)
+./deploy/production.sh deploy
+
+# Откат
+./deploy/production.sh rollback
+```
+
+### Как работает zero downtime deploy:
+
+1. **Бэкап в S3** в начале деплоя (pg_dump каталога + tar D1-данных). Если бэкап не удался — деплой прерывается (`SKIP_BACKUP=1` для отключения).
+2. **Build** нового Docker образа.
+3. **Новый контейнер** стартует на свободном слоте (blue на 3100, green на 3200) в Docker сети `workers-network`. Nginx продолжает слать трафик в активный слот.
+4. **Health check** — ждёт `/ready` (до 120с). Важно: сервер слушает порт только **после** warm-up (восстановление воркеров из каталога). Health check не прошёл → новый слот удаляется, старый не тронут.
+4. **Nginx switch** — рендер шаблона с `__DOMAIN__`/`__ACTIVE_CONTAINER__` → `nginx -t` → reload (без обрыва соединений).
 5. Только после переключения останавливается старый слот (SIGTERM → graceful shutdown 30s).
 
-Настройка на сервере:
+### Настройка на сервере:
+
 ```bash
-cp deploy/.env.production.example deploy/.env.production   # заполнить DOMAIN, порты, S3, ключи
-./deploy/production.sh status
+# 1. Создай .env
+cp .env.example .env
+# Заполни: SECRETS_MASTER_KEY, API_KEY, DOMAIN=workers.fastclass.ru, S3_* и т.д.
+
+# 2. Создай папку для D1 данных
+sudo mkdir -p /var/lib/workers-platform && sudo chown -R 1000:1000 /var/lib/workers-platform
+
+# 3. Запусти
+docker compose up -d
+
+# 4. (опционально) Настрой nginx для SSL
+# certbot --nginx -d workers.fastclass.ru
 ```
 
-Сеть: скрипт рассчитан на **Linux** (`--network host` — контейнер слушает BLUE/GREEN_PORT напрямую и ходит в localhost PostgreSQL/Redis). D1-данные шарятся между слотами через volume `DATA_DIR_HOST:/data`. TLS добавьте certbot'ом (закомментированный блок в шаблоне nginx). `SKIP_BACKUP=1` и `NGINX_MANAGED_EXTERNALLY=1` — ручные режимы обхода.
+### Переменные окружения (.env)
+
+| Переменная | Описание | Пример |
+|------------|----------|--------|
+| `SECRETS_MASTER_KEY` | 32-байтный base64 ключ для шифрования секретов | `openssl rand -base64 32` |
+| `API_KEY` | Static ключ для management API | `wpk_` + `openssl rand -hex 16` |
+| `DOMAIN` | Публичный домен | `workers.fastclass.ru` |
+| `S3_BACKUP_BUCKET` | S3 бакет для бэкапов | `my-backups` |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | AWS credentials для S3 бэкапов | |
+| `S3_ENDPOINT` | Для S3-совместимых (MinIO, Selectel, Yandex) | `https://s3.example.com` |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Postgres credentials | `postgres` / `postgres` / `workers_platform` |
+| `BLUE_PORT` / `GREEN_PORT` | Порты blue/green слотов | `3100` / `3200` |
+| `EGRESS_ALLOWED_DOMAINS` | Куда воркеры могут ходить (fetch) | `api.moodle.org,*.instructure.com` |
+
+### Команды деплоя
+
+```bash
+./deploy/production.sh deploy     # полный деплой: backup -> build -> health -> switch
+./deploy/production.sh status     # статус слотов, контейнеров, health
+./deploy/production.sh rollback   # откат на предыдущую версию
+
+# Переменные окружения для deploy скрипта:
+ENV_FILE=deploy/.env.production SKIP_BACKUP=1 ./deploy/production.sh deploy
+NGINX_MANAGED_EXTERNALLY=1 ./deploy/production.sh deploy  # не трогать nginx
+```
 
 ## Production
 

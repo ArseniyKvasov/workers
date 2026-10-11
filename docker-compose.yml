@@ -1,55 +1,167 @@
+# Production docker-compose: Postgres, Redis, Workers Platform App
+# Usage: docker compose up -d
+
 services:
   postgres:
     image: postgres:16-alpine
+    container_name: workers-postgres
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: workers_platform
-    ports:
-      - "5432:5432"
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-workers_platform}
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
-      timeout: 3s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
       retries: 10
+    networks:
+      - workers-network
 
-  dragonfly:
-    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
-    command: dragonfly --proactor_threads=2
-    ports:
-      - "6379:6379"
+  redis:
+    image: redis:7-alpine
+    container_name: workers-redis
+    command: redis-server --appendonly yes
     volumes:
-      - dragonfly-data:/data
+      - redis-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
+      interval: 10s
+      timeout: 5s
       retries: 10
+    networks:
+      - workers-network
 
-  prometheus:
-    image: prom/prometheus:latest
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus-data:/prometheus
-
-  grafana:
-    image: grafana/grafana:latest
-    ports:
-      - "3001:3000"
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: workers-app
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      - NODE_ENV=production
+      - PORT=3000
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-workers_platform}
+      - REDIS_URL=redis://redis:6379
+      - SECRETS_MASTER_KEY=${SECRETS_MASTER_KEY}
+      - API_KEY=${API_KEY}
+      - DOMAIN=${DOMAIN}
+      - BLUE_PORT=3100
+      - GREEN_PORT=3200
+      - DATA_DIR=/data
+      - EGRESS_ALLOWED_DOMAINS=${EGRESS_ALLOWED_DOMAINS}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - RUNTIME_LOG_LEVEL=${RUNTIME_LOG_LEVEL:-warn}
+      - SERVICE_NAME=workers-platform
+    ports:
+      - "3000:3000"
     volumes:
-      - grafana-data:/var/lib/grafana
-      - ./infra/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - workers-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - workers-network
+    restart: unless-stopped
+
+  # Blue/Green deployment slots (managed by deploy/production.sh)
+  app-blue:
+    profiles: ["blue-green"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: workers-app-blue
+    environment:
+      - NODE_ENV=production
+      - PORT=3100
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-workers_platform}
+      - REDIS_URL=redis://redis:6379
+      - SECRETS_MASTER_KEY=${SECRETS_MASTER_KEY}
+      - API_KEY=${API_KEY}
+      - DOMAIN=${DOMAIN}
+      - BLUE_PORT=3100
+      - GREEN_PORT=3200
+      - DATA_DIR=/data
+      - EGRESS_ALLOWED_DOMAINS=${EGRESS_ALLOWED_DOMAINS}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - RUNTIME_LOG_LEVEL=${RUNTIME_LOG_LEVEL:-warn}
+      - SERVICE_NAME=workers-platform
+    volumes:
+      - workers-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - workers-network
+    restart: unless-stopped
+
+  app-green:
+    profiles: ["blue-green"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: workers-app-green
+    environment:
+      - NODE_ENV=production
+      - PORT=3200
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-workers_platform}
+      - REDIS_URL=redis://redis:6379
+      - SECRETS_MASTER_KEY=${SECRETS_MASTER_KEY}
+      - API_KEY=${API_KEY}
+      - DOMAIN=${DOMAIN}
+      - BLUE_PORT=3100
+      - GREEN_PORT=3200
+      - DATA_DIR=/data
+      - EGRESS_ALLOWED_DOMAINS=${EGRESS_ALLOWED_DOMAINS}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - RUNTIME_LOG_LEVEL=${RUNTIME_LOG_LEVEL:-warn}
+      - SERVICE_NAME=workers-platform
+    volumes:
+      - workers-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - workers-network
+    restart: unless-stopped
+
+  # Nginx reverse proxy (managed by deploy script)
+  nginx:
+    image: nginx:alpine
+    container_name: workers-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
+    environment:
+      - DOMAIN=${DOMAIN}
+      - ACTIVE_PORT=3000
+    depends_on:
+      - app
+    networks:
+      - workers-network
+    restart: unless-stopped
 
 volumes:
   postgres-data:
-  dragonfly-data:
-  prometheus-data:
-  grafana-data:
+  redis-data:
+  workers-data:
+
+networks:
+  workers-network:
+    driver: bridge

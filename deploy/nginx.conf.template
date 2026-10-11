@@ -1,8 +1,8 @@
 # Workers Platform — nginx reverse proxy (rendered by deploy/production.sh)
-# Placeholders: __DOMAIN__, __ACTIVE_PORT__
+# Placeholders: __DOMAIN__, __ACTIVE_CONTAINER__
 
 upstream workers_platform_app {
-    server 127.0.0.1:__ACTIVE_PORT__;
+    server __ACTIVE_CONTAINER__:3000;
     keepalive 32;
 }
 
