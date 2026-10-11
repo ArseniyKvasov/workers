@@ -76,7 +76,9 @@ services:
       - workers-network
     restart: unless-stopped
 
-  # Blue/Green deployment slots (managed by deploy/production.sh)
+  # Blue/Green deployment slots (managed by deploy/production.sh).
+  # Internal app port is always 3000; each slot publishes its host port
+  # (BLUE_PORT/GREEN_PORT) on loopback for host nginx to proxy to.
   app-blue:
     profiles: ["blue-green"]
     build:
@@ -85,19 +87,23 @@ services:
     container_name: workers-app-blue
     environment:
       - NODE_ENV=production
-      - PORT=3100
+      - PORT=3000
       - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-workers_platform}
       - REDIS_URL=redis://redis:6379
       - SECRETS_MASTER_KEY=${SECRETS_MASTER_KEY}
       - API_KEY=${API_KEY}
       - DOMAIN=${DOMAIN}
-      - BLUE_PORT=3100
-      - GREEN_PORT=3200
+      - BLUE_PORT=${BLUE_PORT:-3100}
+      - GREEN_PORT=${GREEN_PORT:-3200}
       - DATA_DIR=/data
       - EGRESS_ALLOWED_DOMAINS=${EGRESS_ALLOWED_DOMAINS}
+      - API_RATE_LIMIT_PER_MINUTE=${API_RATE_LIMIT_PER_MINUTE:-600}
+      - API_RATE_LIMIT_BURST=${API_RATE_LIMIT_BURST:-100}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - RUNTIME_LOG_LEVEL=${RUNTIME_LOG_LEVEL:-warn}
       - SERVICE_NAME=workers-platform
+    ports:
+      - "127.0.0.1:${BLUE_PORT:-3100}:3000"
     volumes:
       - workers-data:/data
     depends_on:
@@ -105,6 +111,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
     networks:
       - workers-network
     restart: unless-stopped
@@ -117,19 +129,23 @@ services:
     container_name: workers-app-green
     environment:
       - NODE_ENV=production
-      - PORT=3200
+      - PORT=3000
       - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-workers_platform}
       - REDIS_URL=redis://redis:6379
       - SECRETS_MASTER_KEY=${SECRETS_MASTER_KEY}
       - API_KEY=${API_KEY}
       - DOMAIN=${DOMAIN}
-      - BLUE_PORT=3100
-      - GREEN_PORT=3200
+      - BLUE_PORT=${BLUE_PORT:-3100}
+      - GREEN_PORT=${GREEN_PORT:-3200}
       - DATA_DIR=/data
       - EGRESS_ALLOWED_DOMAINS=${EGRESS_ALLOWED_DOMAINS}
+      - API_RATE_LIMIT_PER_MINUTE=${API_RATE_LIMIT_PER_MINUTE:-600}
+      - API_RATE_LIMIT_BURST=${API_RATE_LIMIT_BURST:-100}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - RUNTIME_LOG_LEVEL=${RUNTIME_LOG_LEVEL:-warn}
       - SERVICE_NAME=workers-platform
+    ports:
+      - "127.0.0.1:${GREEN_PORT:-3200}:3000"
     volumes:
       - workers-data:/data
     depends_on:
@@ -137,6 +153,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
     networks:
       - workers-network
     restart: unless-stopped

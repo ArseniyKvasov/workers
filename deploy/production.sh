@@ -1,15 +1,33 @@
 #!/usr/bin/env bash
 #
-# Workers Platform — production deploy with blue/green slots.
+# Workers Platform — production deploy with blue/green slots (zero downtime).
 #
-#   ./deploy/production.sh          (default: deploy) backup -> build -> start new slot
-#                                    -> health check -> switch nginx -> stop old slot
-#   ./deploy/production.sh status    show slots, containers, health, last backup
-#   ./deploy/production.sh rollback  redeploy previous image via the same flow
+#   ./deploy/production.sh [deploy] [IMAGE]   preflight -> backup -> build ->
+#                                             migrate -> start new slot ->
+#                                             health check -> update nginx site
+#                                             conf -> graceful reload ->
+#                                             public probe -> stop old slot
+#   ./deploy/production.sh preflight          checks only (safe, read-only-ish)
+#   ./deploy/production.sh status             show slots, health, nginx target
+#   ./deploy/production.sh rollback           redeploy previous image, same flow
 #
-# Zero downtime: nginx keeps serving the active slot until the new container
-# passes /health + /ready (which also guarantees worker warm-up completed).
-# The old slot is removed only after the switch.
+# How zero downtime is achieved:
+#   1. The currently serving slot keeps handling traffic the whole time.
+#   2. The new slot is started alongside it and must pass /ready
+#      (postgres+redis reachable AND worker warm-up from catalog finished)
+#      before it receives any traffic.
+#   3. Only the nginx *site* config is replaced (atomically) and nginx is
+#      asked for a graceful `reload` — existing connections are NOT dropped.
+#   4. The old slot is stopped (SIGTERM, 35s drain) only after the new slot
+#      answers health probes through nginx.
+#
+# What this script deliberately does NOT do ("does not manage all of nginx"):
+#   - it never touches /etc/nginx/nginx.conf or any other site;
+#   - it never installs/enables/disables sites, never runs certbot;
+#   - it never starts, stops or *restarts* nginx (restart drops connections).
+#   It only rewrites ONE file ($NGINX_CONFIG_PATH) and runs ONE graceful
+#   reload command (overridable via $NGINX_RELOAD_CMD, skippable via
+#   NGINX_MANAGED_EXTERNALLY=1 or --no-reload).
 #
 set -Eeuo pipefail
 
@@ -19,11 +37,13 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${ENV_FILE:-${ROOT_DIR}/.env}"
 STATE_FILE="${SCRIPT_DIR}/.active-slot"
 PREV_IMAGE_FILE="${SCRIPT_DIR}/.previous-image"
+RENDERED_FILE="${SCRIPT_DIR}/nginx.conf.rendered"
 
 BLUE_CONTAINER="workers-app-blue"
 GREEN_CONTAINER="workers-app-green"
-MAIN_CONTAINER="workers-app"
 NETWORK="workers-network"
+INTERNAL_PORT="3000"   # port the app listens on INSIDE every slot container
+NO_RELOAD=0
 
 log()  { printf '\033[1;34m[deploy]\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[1;33m[deploy]\033[0m %s\n' "$*" >&2; }
@@ -32,14 +52,34 @@ die()  { err "$*"; exit 1; }
 
 usage() {
   cat <<EOF
-Usage: $0 [deploy|status|rollback]
+Usage: $0 [deploy [IMAGE] | preflight | status | rollback] [--no-reload]
+
+Commands:
+  deploy [IMAGE]  full zero-downtime deploy (default). Uses IMAGE if given,
+                  otherwise builds from git HEAD.
+  preflight       run pre-deploy checks only, deploy nothing.
+  status          show slots, health, nginx target, last backup.
+  rollback        redeploy the previously serving image via the same flow.
+
+Options:
+  --no-reload     render + install nginx site conf but skip the reload
+                  (traffic stays on the old slot until you reload manually).
 
 Environment:
   ENV_FILE                    env file to load (default: .env in project root)
-  SKIP_BACKUP=1               skip S3 backup (dangerous; deploy refuses by default)
-  NGINX_MANAGED_EXTERNALLY=1  do not touch nginx, only print the switch command
-  HEALTH_TIMEOUT              seconds to wait for the new slot (default: 120)
-  NGINX_CONFIG_PATH           path to nginx site config (default: /etc/nginx/sites-available/workers-platform.conf)
+  SKIP_BACKUP=1               skip S3 backup (deploy refuses by default)
+  SKIP_MIGRATE=1              skip DB migrations (default: run from new image)
+  NGINX_MANAGED_EXTERNALLY=1  only render the site conf, print manual steps,
+                              do not install / test / reload anything
+  NGINX_CONFIG_PATH           nginx *site* conf to update
+                              (default: /etc/nginx/sites-available/workers-platform.conf)
+  NGINX_RELOAD_CMD            graceful reload command
+                              (default: sudo nginx -s reload)
+  NGINX_TEST_CMD              config test command (default: sudo nginx -t)
+  PUBLIC_HEALTH_URL           probe through nginx after switch
+                              (default: http://127.0.0.1/health)
+  HEALTH_TIMEOUT              seconds to wait for the new slot (default: 180)
+  BACKUP_RETENTION            how many recent backups to keep (default: 14)
 EOF
 }
 
@@ -52,12 +92,15 @@ load_env() {
   fi
   local tmp_env
   tmp_env="$(mktemp)"
-  grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_FILE" > "$tmp_env"
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp_env'" RETURN
+  # Strip comments/exports/blank lines; keep only plain KEY=... assignments.
+  sed -e 's/^[[:space:]]*export[[:space:]]\+//' -e 's/[[:space:]]*#[^"'\'']*$//' \
+    "$ENV_FILE" | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' > "$tmp_env" || true
   set -a
   # shellcheck disable=SC1090
   source "$tmp_env"
   set +a
-  rm -f "$tmp_env"
 }
 
 require_env() {
@@ -67,33 +110,139 @@ require_env() {
   fi
 }
 
-# ---------------------------------------------------------------------------
-# Slot helpers
-# ---------------------------------------------------------------------------
-container_for_slot() { case "$1" in blue) echo "workers-app-blue" ;; green) echo "workers-app-green" ;; esac; }
-port_for_slot()      { case "$1" in blue) echo "3100" ;; green) echo "3200" ;; esac; }
+blue_port()  { echo "${BLUE_PORT:-3100}"; }
+green_port() { echo "${GREEN_PORT:-3200}"; }
 
-slot_is_healthy() {
-  local container="$1"
-  docker exec "$container" node -e "fetch('http://localhost:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1
+container_for_slot() { case "$1" in blue) echo "$BLUE_CONTAINER" ;; green) echo "$GREEN_CONTAINER" ;; *) die "unknown slot: $1" ;; esac; }
+port_for_slot()      { case "$1" in blue) blue_port ;; green) green_port ;; *) die "unknown slot: $1" ;; esac; }
+other_slot()         { case "$1" in blue) echo green ;; green) echo blue ;; *) die "unknown slot: $1" ;; esac; }
+
+# Port the app listens on inside a running slot container (default 3000).
+container_port() {
+  local container="$1" p
+  p="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
+    | sed -n 's/^PORT=//p' | tail -n 1 || true)"
+  [[ -n "${p:-}" ]] && echo "$p" || echo "$INTERNAL_PORT"
+}
+
+probe_ready() {
+  # $1 = container name. True when /ready answers 200.
+  local container="$1" port
+  port="$(container_port "$container")"
+  docker exec "$container" node -e \
+    "fetch('http://localhost:${port}/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" \
+    >/dev/null 2>&1
+}
+
+container_running() {
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$1"
 }
 
 active_slot() {
-  local from_state="${1:-}"
-  if [[ -f "$STATE_FILE" && -z "$from_state" ]]; then
-    from_state="$(cat "$STATE_FILE")"
+  # Prefer the recorded state; fall back to probing when it is missing.
+  if [[ -f "$STATE_FILE" ]]; then
+    local recorded
+    recorded="$(tr -d '[:space:]' < "$STATE_FILE")"
+    case "$recorded" in blue|green) echo "$recorded"; return 0 ;; esac
   fi
-  case "$from_state" in
-    blue|green) echo "$from_state"; return 0 ;;
-  esac
-  local blue_healthy green_healthy
-  blue_healthy=$(docker exec workers-app-blue node -e "fetch('http://localhost:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1 && echo true || echo false)
-  green_healthy=$(docker exec workers-app-green node -e "fetch('http://localhost:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1 && echo true || echo false)
-  if [[ "$blue_healthy" == "true" && "$green_healthy" == "false" ]]; then echo blue
-  elif [[ "$green_healthy" == "true" && "$blue_healthy" == "false" ]]; then echo green
+  local blue_ok=0 green_ok=0
+  container_running "$BLUE_CONTAINER"  && probe_ready "$BLUE_CONTAINER"  && blue_ok=1 || true
+  container_running "$GREEN_CONTAINER" && probe_ready "$GREEN_CONTAINER" && green_ok=1 || true
+  if   [[ "$blue_ok" == "1" && "$green_ok" == "0" ]]; then echo blue
+  elif [[ "$green_ok" == "1" && "$blue_ok" == "0" ]]; then echo green
+  else return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Preflight — fail fast before touching anything stateful
+# ---------------------------------------------------------------------------
+preflight() {
+  local failures=0
+  check() { # $1 = description, $@ = command...
+    local desc="$1"; shift
+    if "$@" >/dev/null 2>&1; then log "preflight ok: $desc"
+    else err "preflight FAIL: $desc"; failures=$((failures + 1)); fi
+  }
+
+  log "preflight: checking deploy prerequisites..."
+
+  check "docker daemon reachable" docker info
+  [[ -f "${SCRIPT_DIR}/nginx.conf.template" ]] \
+    && log "preflight ok: nginx template present" \
+    || { err "preflight FAIL: nginx template missing"; failures=$((failures + 1)); }
+  [[ -f "${ROOT_DIR}/Dockerfile" ]] \
+    && log "preflight ok: Dockerfile present" \
+    || { err "preflight FAIL: Dockerfile missing"; failures=$((failures + 1)); }
+
+  local missing=()
+  for v in DOMAIN SECRETS_MASTER_KEY API_KEY POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB; do
+    [[ -n "${!v:-}" ]] || missing+=("$v")
+  done
+  if [[ "${#missing[@]}" -eq 0 ]]; then log "preflight ok: required env vars set"
+  else err "preflight FAIL: missing env vars: ${missing[*]}"; failures=$((failures + 1)); fi
+
+  if [[ "$(blue_port)" == "$(green_port)" ]]; then
+    err "preflight FAIL: BLUE_PORT and GREEN_PORT must differ"
+    failures=$((failures + 1))
   else
-    return 1
+    log "preflight ok: slot ports blue=$(blue_port) green=$(green_port)"
   fi
+
+  # Infra the new slot depends on must already run (deploy never starts them).
+  for c in workers-postgres workers-redis; do
+    if container_running "$c"; then log "preflight ok: container $c running"
+    else err "preflight FAIL: container $c not running (start it: docker compose up -d postgres redis)"
+      failures=$((failures + 1)); fi
+  done
+  docker network inspect "$NETWORK" >/dev/null 2>&1 \
+    && log "preflight ok: network $NETWORK exists" \
+    || { err "preflight FAIL: network $NETWORK missing (docker compose up -d)"; failures=$((failures + 1)); }
+
+  # S3 backup prerequisites (unless explicitly skipped).
+  if [[ "${SKIP_BACKUP:-0}" == "1" ]]; then
+    warn "preflight: SKIP_BACKUP=1 — backup checks skipped"
+  else
+    command -v aws >/dev/null 2>&1 \
+      && log "preflight ok: aws CLI present" \
+      || { err "preflight FAIL: aws CLI not found (or set SKIP_BACKUP=1)"; failures=$((failures + 1)); }
+    if [[ -z "${S3_BACKUP_BUCKET:-}" ]]; then
+      err "preflight FAIL: S3_BACKUP_BUCKET not set (or set SKIP_BACKUP=1)"
+      failures=$((failures + 1))
+    else
+      log "preflight ok: S3 backup target s3://${S3_BACKUP_BUCKET}/${S3_BACKUP_PREFIX:-workers-platform}/"
+    fi
+  fi
+
+  # We must be able to install the single site conf (directly or via sudo).
+  if [[ "${NGINX_MANAGED_EXTERNALLY:-0}" == "1" ]]; then
+    warn "preflight: NGINX_MANAGED_EXTERNALLY=1 — nginx install/reload checks skipped"
+  else
+    local cfg="${NGINX_CONFIG_PATH:-/etc/nginx/sites-available/workers-platform.conf}"
+    if [[ -w "$cfg" || -w "$(dirname "$cfg")" ]]; then
+      log "preflight ok: nginx site conf writable ($cfg)"
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+      log "preflight ok: nginx site conf installable via sudo ($cfg)"
+    else
+      err "preflight FAIL: cannot write $cfg and passwordless sudo unavailable"
+      failures=$((failures + 1))
+    fi
+  fi
+
+  # Free disk (images + pg dump need room).
+  local free_kb
+  free_kb="$(df -k "$ROOT_DIR" | awk 'NR==2 {print $4}')"
+  if [[ "${free_kb:-0}" -ge 2097152 ]]; then
+    log "preflight ok: disk free $((free_kb / 1024)) MB"
+  else
+    err "preflight FAIL: less than 2 GB free on $(df "$ROOT_DIR" | awk 'NR==2 {print $1}') (${free_kb:-?} KB)"
+    failures=$((failures + 1))
+  fi
+
+  if [[ "$failures" -gt 0 ]]; then
+    die "preflight failed with $failures problem(s) — fix them and re-run"
+  fi
+  log "preflight: all checks passed"
 }
 
 # ---------------------------------------------------------------------------
@@ -101,35 +250,54 @@ active_slot() {
 # ---------------------------------------------------------------------------
 timestamp() { date -u +"%Y%m%dT%H%M%SZ"; }
 
+s3_args() {
+  # Print endpoint args for aws cli when S3_ENDPOINT is set (S3-compatible storage).
+  if [[ -n "${S3_ENDPOINT:-}" ]]; then printf '%s' "--endpoint-url $S3_ENDPOINT"; fi
+}
+
+check_s3_auth() {
+  # Static keys win when set; otherwise require a working IAM role/instance profile.
+  if [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
+    return 0
+  fi
+  # shellcheck disable=SC2046
+  if aws sts get-caller-identity $(s3_args) >/dev/null 2>&1; then
+    log "backup: using ambient AWS credentials (IAM role / instance profile)"
+    return 0
+  fi
+  die "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY not set and no IAM role credentials found"
+}
+
 run_pg_dump() {
-  docker exec workers-postgres pg_dump --no-owner --no-privileges -U "${POSTGRES_USER:-postgres}" "${POSTGRES_DB:-workers_platform}"
+  docker exec workers-postgres pg_dump --no-owner --no-privileges \
+    -U "${POSTGRES_USER:-postgres}" "${POSTGRES_DB:-workers_platform}"
 }
 
 do_backup() {
-  local stamp backup_prefix pg_ok=0 data_ok=0
-  stamp="$(timestamp)"
-  backup_prefix="s3://${S3_BACKUP_BUCKET}/${S3_BACKUP_PREFIX}/${stamp}"
-
   if [[ "${SKIP_BACKUP:-0}" == "1" ]]; then
-    warn "SKIP_BACKUP=1 — skipping S3 backup (deploy continues WITHOUT a safety net)"
+    warn "SKIP_BACKUP=1 — deploying WITHOUT a backup safety net"
     return 0
   fi
-  command -v aws > /dev/null 2>&1 || die "aws CLI not found; install it or set SKIP_BACKUP=1"
-  [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]] \
-    || die "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY not set"
+  command -v aws >/dev/null 2>&1 || die "aws CLI not found; install it or set SKIP_BACKUP=1"
+  require_env S3_BACKUP_BUCKET
+  check_s3_auth
+
+  local stamp backup_prefix pg_ok=0 data_ok=0
+  stamp="$(timestamp)"
+  backup_prefix="s3://${S3_BACKUP_BUCKET}/${S3_BACKUP_PREFIX:-workers-platform}/${stamp}"
 
   log "backup: postgres -> ${backup_prefix}/postgres.sql.gz"
-  if run_pg_dump | gzip | aws s3 cp - "${backup_prefix}/postgres.sql.gz" \
-      ${S3_ENDPOINT:+--endpoint-url "$S3_ENDPOINT"}; then
+  # shellcheck disable=SC2046
+  if run_pg_dump | gzip | aws s3 cp - "${backup_prefix}/postgres.sql.gz" $(s3_args); then
     pg_ok=1
   else
     warn "postgres backup FAILED"
   fi
 
   log "backup: data dir -> ${backup_prefix}/data.tgz"
-  if docker run --rm -v workers-data:/data -v "$(pwd):/backup" alpine \
-      tar -czf - -C /data . | aws s3 cp - "${backup_prefix}/data.tgz" \
-        ${S3_ENDPOINT:+--endpoint-url "$S3_ENDPOINT"}; then
+  # shellcheck disable=SC2046
+  if docker run --rm -v workers-data:/data:ro alpine \
+      tar -czf - -C /data . 2>/dev/null | aws s3 cp - "${backup_prefix}/data.tgz" $(s3_args); then
     data_ok=1
   else
     warn "data dir backup FAILED"
@@ -138,6 +306,7 @@ do_backup() {
   if [[ "$pg_ok" != "1" || "$data_ok" != "1" ]]; then
     die "backup incomplete (pg=$pg_ok data=$data_ok) — refusing to deploy. Fix S3/credentials or set SKIP_BACKUP=1 explicitly."
   fi
+  log "backup complete: $backup_prefix"
 
   apply_backup_retention
 }
@@ -145,41 +314,119 @@ do_backup() {
 apply_backup_retention() {
   local keep="${BACKUP_RETENTION:-14}"
   [[ "$keep" =~ ^[0-9]+$ ]] || keep=14
-  local ep=(); [[ -n "${S3_ENDPOINT:-}" ]] && ep=(--endpoint-url "$S3_ENDPOINT")
-
-  aws s3 ls "s3://${S3_BACKUP_BUCKET}/${S3_BACKUP_PREFIX}/" "${ep[@]}" 2>/dev/null \
-    | awk '{print $NF}' | grep -E '^[0-9]{8}T[0-9]{6}Z$' | sort -r \
-    | tail -n +$((keep + 1)) \
-    | while read -r old; do
-        aws s3 rm --recursive "s3://${S3_BACKUP_BUCKET}/${S3_BACKUP_PREFIX}/${old}" "${ep[@]}" > /dev/null 2>&1 || true
-        log "backup retention: removed $old"
-      done
+  local base="s3://${S3_BACKUP_BUCKET}/${S3_BACKUP_PREFIX:-workers-platform}/"
+  local listed old
+  # shellcheck disable=SC2046
+  listed="$(aws s3 ls "$base" $(s3_args) 2>/dev/null | awk '{print $NF}' \
+    | sed 's:/$::' | grep -E '^[0-9]{8}T[0-9]{6}Z$' | sort -r || true)"
+  [[ -z "$listed" ]] && return 0
+  echo "$listed" | tail -n +"$((keep + 1))" | while read -r old; do
+    [[ -z "$old" ]] && continue
+    # shellcheck disable=SC2046
+    if aws s3 rm --recursive "${base}${old}/" $(s3_args) >/dev/null 2>&1; then
+      log "backup retention: removed $old (keeping last $keep)"
+    fi
+  done
 }
 
 # ---------------------------------------------------------------------------
-# Nginx — write config to host and graceful reload
+# Nginx site conf — scoped update only; never manages the whole nginx
 # ---------------------------------------------------------------------------
-switch_nginx() {
-  local target_slot="$1" template rendered active_container
+render_nginx_conf() {
+  local target_slot="$1" template active_port
   template="${SCRIPT_DIR}/nginx.conf.template"
-  rendered="${SCRIPT_DIR}/nginx.conf.rendered"
   [[ -f "$template" ]] || die "nginx template not found: $template"
+  active_port="$(port_for_slot "$target_slot")"
 
-  active_container="workers-app-${target_slot}"
-  sed -e "s/__DOMAIN__/${DOMAIN}/g" -e "s/__ACTIVE_CONTAINER__/${active_container}/g" "$template" > "$rendered"
+  # Escape sed-special chars in DOMAIN (&, \, |).
+  local domain_escaped
+  domain_escaped="$(printf '%s' "$DOMAIN" | sed -e 's/[\\/&|]/\\&/g')"
+
+  sed -e "s|__DOMAIN__|${domain_escaped}|g" \
+      -e "s|__ACTIVE_PORT__|${active_port}|g" \
+      "$template" > "$RENDERED_FILE"
+
+  if grep -vE '^[[:space:]]*#' "$RENDERED_FILE" | grep -Eq '__[A-Z_]+__'; then
+    err "unreplaced placeholders left in rendered nginx conf:"
+    grep -Eo '__[A-Z_]+__' "$RENDERED_FILE" | sort -u >&2 || true
+    die "nginx template uses unknown placeholders (expected __DOMAIN__, __ACTIVE_PORT__)"
+  fi
+  log "nginx: rendered site conf for slot ${target_slot} (127.0.0.1:${active_port})"
+}
+
+install_nginx_conf() {
+  # Atomically replace ONLY the site conf; keep a backup to roll back the file.
+  local config_path="${NGINX_CONFIG_PATH:-/etc/nginx/sites-available/workers-platform.conf}"
+  local backup="${RENDERED_FILE}.prev"
+
+  if [[ -f "$config_path" ]]; then cp "$config_path" "$backup" 2>/dev/null || true; fi
+
+  if [[ -w "$config_path" || (! -e "$config_path" && -w "$(dirname "$config_path")") ]]; then
+    local tmp_new
+    tmp_new="$(mktemp "$(dirname "$config_path")/.workers-platform.XXXXXX")"
+    cp "$RENDERED_FILE" "$tmp_new"
+    mv "$tmp_new" "$config_path"
+  elif command -v sudo >/dev/null 2>&1; then
+    local tmp_new
+    tmp_new="$(mktemp)"
+    cp "$RENDERED_FILE" "$tmp_new"
+    sudo cp "$tmp_new" "$config_path"
+    rm -f "$tmp_new"
+  else
+    die "cannot write $config_path (no permission, no sudo)"
+  fi
+  log "nginx: site conf updated ($config_path)"
+}
+
+test_nginx_conf() {
+  local test_cmd="${NGINX_TEST_CMD:-sudo nginx -t}"
+  local output
+  if output="$(bash -c "$test_cmd" 2>&1)"; then
+    echo "$output" | tail -n 5 >&2 || true
+    log "nginx: config test passed"
+  else
+    # Restore previous site conf so a bad render can never break nginx.
+    local config_path="${NGINX_CONFIG_PATH:-/etc/nginx/sites-available/workers-platform.conf}"
+    if [[ -f "${RENDERED_FILE}.prev" ]]; then
+      warn "restoring previous site conf"
+      if [[ -w "$config_path" ]]; then cp "${RENDERED_FILE}.prev" "$config_path"
+      elif command -v sudo >/dev/null 2>&1; then sudo cp "${RENDERED_FILE}.prev" "$config_path"; fi
+    fi
+    die "nginx config test failed — old slot still serving, deploy aborted"
+  fi
+}
+
+reload_nginx() {
+  if [[ "$NO_RELOAD" == "1" ]]; then
+    warn "--no-reload: site conf installed but nginx NOT reloaded; traffic still on the old slot"
+    return 1
+  fi
+  local reload_cmd="${NGINX_RELOAD_CMD:-sudo nginx -s reload}"
+  # Graceful reload only: workers finish in-flight requests, no dropped connections.
+  if bash -c "$reload_cmd"; then
+    log "nginx: gracefully reloaded (zero downtime, existing connections kept)"
+  else
+    die "nginx reload failed — new slot healthy but traffic not switched; old slot still serving"
+  fi
+  return 0
+}
+
+switch_nginx() {
+  local target_slot="$1"
+  render_nginx_conf "$target_slot"
 
   if [[ "${NGINX_MANAGED_EXTERNALLY:-0}" == "1" ]]; then
-    warn "NGINX_MANAGED_EXTERNALLY=1 — apply manually:"
-    warn "  install $rendered to ${NGINX_CONFIG_PATH:-/etc/nginx/sites-available/workers-platform.conf} and reload nginx"
-    return 0
+    warn "NGINX_MANAGED_EXTERNALLY=1 — apply manually, then stop the old slot:"
+    warn "  install ${RENDERED_FILE}"
+    warn "      to ${NGINX_CONFIG_PATH:-/etc/nginx/sites-available/workers-platform.conf}"
+    warn "  nginx -t && nginx -s reload   # graceful, keeps connections"
+    warn "  docker stop -t 35 $(container_for_slot "$(active_slot 2>/dev/null || echo "$target_slot")")"
+    return 1
   fi
 
-  # Write rendered config to host nginx site
-  local config_path="${NGINX_CONFIG_PATH:-/etc/nginx/sites-available/workers-platform.conf}"
-  sudo cp "$rendered" "$config_path"
-  sudo nginx -t || die "nginx config test failed — keeping old config"
-  sudo nginx -s reload || die "nginx reload failed"
-  log "nginx: traffic switched to ${active_container} (${DOMAIN})"
+  install_nginx_conf
+  test_nginx_conf
+  reload_nginx
 }
 
 # ---------------------------------------------------------------------------
@@ -187,71 +434,112 @@ switch_nginx() {
 # ---------------------------------------------------------------------------
 build_image() {
   local tag="${IMAGE_NAME:-workers-platform}"
-  local version
+  local version build_log
   version="$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo latest)"
   tag="${tag}:${version}"
-  log "building image ${tag}"
-  docker build -t "$tag" "$ROOT_DIR" > /dev/null
+  build_log="${SCRIPT_DIR}/.build.log"
+  log "building image ${tag} (log: ${build_log})"
+  if docker build -t "$tag" "$ROOT_DIR" >"$build_log" 2>&1; then
+    log "image built: ${tag}"
+  else
+    err "docker build failed — last 30 lines:"
+    tail -n 30 "$build_log" >&2 || true
+    die "aborting deploy; old slot untouched"
+  fi
   echo "$tag"
+}
+
+run_migrations() {
+  local image="$1"
+  if [[ "${SKIP_MIGRATE:-0}" == "1" ]]; then
+    warn "SKIP_MIGRATE=1 — skipping DB migrations"
+    return 0
+  fi
+  log "migrations: applying from image ${image} (backup already taken)"
+  if docker run --rm --network "$NETWORK" \
+      -e DATABASE_URL="postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-workers_platform}" \
+      "$image" node packages/catalog/dist/migrate-cli.js >&2; then
+    log "migrations: up to date"
+  else
+    die "migrations failed — aborting before any traffic switch (restore from S3 backup if needed)"
+  fi
 }
 
 start_slot() {
   local slot="$1" image="$2" container port
-  container="workers-app-${slot}"
-  port=$([[ "$slot" == "blue" ]] && echo 3100 || echo 3200)
+  container="$(container_for_slot "$slot")"
+  port="$(port_for_slot "$slot")"
 
-  docker rm -f "$container" > /dev/null 2>&1 || true
-  log "starting ${container} (image ${image}, port ${port})"
+  docker rm -f "$container" >/dev/null 2>&1 || true
+  log "starting ${container} (image ${image}, 127.0.0.1:${port} -> ${INTERNAL_PORT})"
 
   docker run -d --name "$container" \
-    --network workers-network \
+    --network "$NETWORK" \
     --restart unless-stopped \
-    -e PORT=3000 \
+    -p "127.0.0.1:${port}:${INTERNAL_PORT}" \
+    -e PORT="$INTERNAL_PORT" \
     -e NODE_ENV=production \
     -e DATABASE_URL="postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-workers_platform}" \
     -e REDIS_URL=redis://redis:6379 \
     -e SECRETS_MASTER_KEY="${SECRETS_MASTER_KEY}" \
     -e API_KEY="${API_KEY}" \
     -e DOMAIN="${DOMAIN}" \
-    -e BLUE_PORT=3100 \
-    -e GREEN_PORT=3200 \
+    -e BLUE_PORT="$(blue_port)" \
+    -e GREEN_PORT="$(green_port)" \
     -e DATA_DIR=/data \
-    -e EGRESS_ALLOWED_DOMAINS="${EGRESS_ALLOWED_DOMAINS}" \
+    -e EGRESS_ALLOWED_DOMAINS="${EGRESS_ALLOWED_DOMAINS:-}" \
+    -e API_RATE_LIMIT_PER_MINUTE="${API_RATE_LIMIT_PER_MINUTE:-600}" \
+    -e API_RATE_LIMIT_BURST="${API_RATE_LIMIT_BURST:-100}" \
     -e LOG_LEVEL="${LOG_LEVEL:-info}" \
     -e RUNTIME_LOG_LEVEL="${RUNTIME_LOG_LEVEL:-warn}" \
     -e SERVICE_NAME=workers-platform \
     -v workers-data:/data \
     --memory "${CONTAINER_MEMORY:-2g}" \
     --cpus "${CONTAINER_CPUS:-2}" \
-    "$image" > /dev/null
+    "$image" >/dev/null
 }
 
 stop_slot() {
   local slot="$1" container
-  container="workers-app-${slot}"
-  if docker ps --format '{{.Names}}' | grep -qx "$container"; then
-    log "stopping ${container} (${2:-old slot})"
-    docker stop -t 35 "$container" > /dev/null
+  container="$(container_for_slot "$slot")"
+  if container_running "$container"; then
+    log "stopping ${container} (${2:-old slot}, 35s graceful drain)"
+    docker stop -t 35 "$container" >/dev/null
   fi
-  docker rm -f "$container" > /dev/null 2>&1 || true
+  docker rm -f "$container" >/dev/null 2>&1 || true
 }
 
 wait_healthy() {
-  local slot="$1" timeout="${HEALTH_TIMEOUT:-120}" waited=0
-  local container="workers-app-${slot}"
+  local slot="$1" timeout="${HEALTH_TIMEOUT:-180}" waited=0
+  local container
+  container="$(container_for_slot "$slot")"
 
   while (( waited < timeout )); do
-    if docker exec "$container" node -e "fetch('http://localhost:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; then
-      log "slot ${slot} is healthy (after ${waited}s, warm-up complete)"
+    if probe_ready "$container"; then
+      log "slot ${slot} is healthy (after ${waited}s; warm-up complete)"
       return 0
     fi
     sleep 3
     waited=$((waited + 3))
   done
-  warn "last /ready response from ${container}:"
-  docker exec "$container" node -e "fetch('http://localhost:3000/ready').then(r=>console.log(r.status, r.ok)).catch(e=>console.error(e))" 2>&1 | head -c 500 || true
-  echo
+  warn "slot ${slot} failed /ready within ${timeout}s; last response:"
+  local port
+  port="$(container_port "$container")"
+  docker exec "$container" node -e \
+    "fetch('http://localhost:${port}/ready').then(async r=>console.log(r.status, await r.text())).catch(e=>console.error(String(e)))" \
+    2>&1 | head -c 1000 || true
+  echo >&2
+  docker logs --tail 30 "$container" >&2 || true
   return 1
+}
+
+probe_public() {
+  local url="${PUBLIC_HEALTH_URL:-http://127.0.0.1/health}"
+  if curl -fsS -m 10 -H "Host: ${DOMAIN}" "$url" >/dev/null 2>&1; then
+    log "public probe OK (${url}, Host: ${DOMAIN})"
+  else
+    die "public probe FAILED (${url}) — new slot healthy directly but not via nginx; old slot still serving, check nginx"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -260,108 +548,124 @@ wait_healthy() {
 cmd_deploy() {
   local incoming_image="${1:-}"
 
-  require_env DOMAIN; require_env BLUE_PORT; require_env GREEN_PORT
-  require_env POSTGRES_USER; require_env POSTGRES_PASSWORD; require_env POSTGRES_DB
-  require_env SECRETS_MASTER_KEY; require_env API_KEY; require_env DOMAIN
+  preflight
+  do_backup
 
-  local active target
-  if ! active="$(active_slot)"; then
-    warn "cannot determine active slot (no state file, no healthy slot) — assuming first deploy"
-    active=""
-  fi
-
-  if [[ -n "$active" ]]; then
-    target="$( [[ "$active" == "blue" ]] && echo green || echo blue )"
+  local active="" target
+  if active="$(active_slot)"; then
+    target="$(other_slot "$active")"
   else
+    warn "cannot determine active slot (first deploy?) — deploying into: blue"
+    active=""
     target="blue"
   fi
-
   log "active slot: ${active:-none}, deploying into: $target"
-  do_backup
 
   local image
   if [[ -n "$incoming_image" ]]; then
+    docker image inspect "$incoming_image" >/dev/null 2>&1 \
+      || die "image not found locally: $incoming_image (docker pull it first)"
     image="$incoming_image"
   else
     image="$(build_image)"
   fi
 
+  run_migrations "$image"
   start_slot "$target" "$image"
 
   if ! wait_healthy "$target"; then
-    err "new slot ${target} failed health checks — rolling back to old slot"
+    err "new slot ${target} failed health checks — removing it, old slot untouched"
     stop_slot "$target" "(failed slot)"
-    die "deploy aborted; ${active:-none} slot untouched"
+    die "deploy aborted; active slot '${active:-none}' still serving"
   fi
 
-  switch_nginx "$target"
+  local switched=0
+  if switch_nginx "$target"; then
+    switched=1
+  fi
 
-  # Verify through nginx
-  if [[ "${NGINX_MANAGED_EXTERNALLY:-0}" != "1" ]]; then
-    if curl -fsS -m 10 "http://localhost/health" > /dev/null 2>&1; then
-      log "public health probe OK"
-    else
-      warn "public health probe failed — old slot kept, check nginx"
-      die "deploy incomplete: new slot healthy directly, but probe via nginx failed"
+  if [[ "$switched" == "1" ]]; then
+    probe_public
+    if [[ -n "$active" ]]; then
+      docker inspect --format '{{.Config.Image}}' "$(container_for_slot "$active")" > "$PREV_IMAGE_FILE" 2>/dev/null || true
+      stop_slot "$active" "previous slot"
     fi
+    echo "$target" > "$STATE_FILE"
+    docker image prune -f --filter "dangling=true" >/dev/null 2>&1 || true
+    log "deploy complete: slot=${target} image=${image}"
+  else
+    warn "nginx switch deferred (external management / --no-reload):"
+    warn "  new slot ${target} is healthy but NOT serving traffic yet;"
+    warn "  old slot '${active:-none}' still serving — nothing was stopped."
   fi
-
-  if [[ -n "$active" ]]; then
-    docker inspect --format '{{.Config.Image}}' "workers-app-${active}" > "${PREV_IMAGE_FILE}" 2>/dev/null || true
-    stop_slot "$active"
-  fi
-
-  echo "$target" > "${STATE_FILE}"
-  log "deploy complete: slot=${target} image=${image}"
-  log "workers were warmed up from the catalog before the traffic switch (zero downtime)"
 }
 
 cmd_rollback() {
-  require_env DOMAIN; require_env BLUE_PORT; require_env GREEN_PORT
-
   [[ -f "$PREV_IMAGE_FILE" ]] || die "no previous image recorded — nothing to roll back to"
   local previous_image
-  previous_image="$(cat "$PREV_IMAGE_FILE")"
-
-  local active target
-  active="$(active_slot)" || die "cannot determine active slot"
-  target="$( [[ "$active" == "blue" ]] && echo green || echo blue )"
-
-  log "rollback: redeploying ${previous_image} into slot ${target}"
+  previous_image="$(tr -d '[:space:]' < "$PREV_IMAGE_FILE")"
+  [[ -n "$previous_image" ]] || die "previous image file is empty"
+  docker image inspect "$previous_image" >/dev/null 2>&1 \
+    || die "previous image no longer present locally: $previous_image (cannot roll back)"
+  log "rollback: redeploying ${previous_image} via the standard flow"
   cmd_deploy "$previous_image"
 }
 
 cmd_status() {
+  if [[ -z "${DOMAIN:-}" ]]; then warn "DOMAIN not set in $ENV_FILE"; fi
   echo "== slots =="
   for slot in blue green; do
-    local container="workers-app-${slot}"
-    local running health
-    running=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$container" && echo yes || echo no)
-    if docker exec "$container" node -e "fetch('http://localhost:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; then
-      health=healthy
-    else
-      health=unhealthy
+    local container running health image
+    container="$(container_for_slot "$slot")"
+    running="no"; health="unknown"; image="-"
+    if container_running "$container"; then
+      running="yes"
+      image="$(docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null || echo '?')"
+      if probe_ready "$container"; then health="healthy"; else health="unhealthy"; fi
     fi
-    printf '  %-5s container=%-20s running=%-3s health=%s\n' "$slot" "$container" "$running" "$health"
+    printf '  %-5s container=%-18s port=%-5s running=%-3s health=%-9s image=%s\n' \
+      "$slot" "$container" "$(port_for_slot "$slot")" "$running" "$health" "$image"
   done
-  if [[ -f "$STATE_FILE" ]]; then
-    echo "active slot: $(cat "$STATE_FILE")"
-  else
-    echo "active slot: unknown (no state file)"
-  fi
+  if [[ -f "$STATE_FILE" ]]; then echo "active slot: $(cat "$STATE_FILE")"
+  else echo "active slot: unknown (no state file)"; fi
   [[ -f "$PREV_IMAGE_FILE" ]] && echo "previous image: $(cat "$PREV_IMAGE_FILE")"
+  local cfg="${NGINX_CONFIG_PATH:-/etc/nginx/sites-available/workers-platform.conf}"
+  if [[ -f "$cfg" ]]; then
+    echo "nginx site conf: $cfg -> $(grep -E '^\s*server\s+127' "$cfg" 2>/dev/null | head -n 1 | tr -d ' ;' || echo '?')"
+  else
+    echo "nginx site conf: $cfg (not installed)"
+  fi
   echo "domain: ${DOMAIN:-?}"
+  if [[ "${SKIP_BACKUP:-0}" != "1" && -n "${S3_BACKUP_BUCKET:-}" ]] && command -v aws >/dev/null 2>&1; then
+    echo "last backup: $(aws s3 ls "s3://${S3_BACKUP_BUCKET}/${S3_BACKUP_PREFIX:-workers-platform}/" 2>/dev/null | sort | tail -n 1 || echo '?')"
+  fi
 }
 
 # ---------------------------------------------------------------------------
 main() {
-  local cmd="${1:-deploy}"  # deploy is default
+  local cmd="deploy"
+  if [[ $# -gt 0 ]]; then
+    case "$1" in
+      deploy|preflight|status|rollback) cmd="$1"; shift ;;
+      --no-reload) cmd="deploy" ;;
+      -h|--help|help) usage; exit 0 ;;
+      *) usage; die "unknown command: $1" ;;
+    esac
+  fi
+  for arg in "$@"; do
+    case "$arg" in
+      --no-reload) NO_RELOAD=1 ;;
+      -h|--help) usage; exit 0 ;;
+      *) if [[ "$cmd" == "deploy" && -z "${DEPLOY_IMAGE:-}" ]]; then DEPLOY_IMAGE="$arg"
+         else usage; die "unexpected argument: $arg"; fi ;;
+    esac
+  done
+
   case "$cmd" in
-    deploy)   shift; load_env; cmd_deploy "${1:-}" ;;
-    rollback) load_env; cmd_rollback ;;
-    status)   load_env; cmd_status ;;
-    -h|--help|help) usage; exit 0 ;;
-    *) usage; die "unknown command: $cmd" ;;
+    deploy)    load_env; cmd_deploy "${DEPLOY_IMAGE:-}" ;;
+    preflight) load_env; preflight ;;
+    rollback)  load_env; cmd_rollback ;;
+    status)    load_env; cmd_status ;;
   esac
 }
 

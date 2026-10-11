@@ -1,8 +1,15 @@
 # Workers Platform — nginx reverse proxy (rendered by deploy/production.sh)
-# Placeholders: __DOMAIN__, __ACTIVE_CONTAINER__
+# Template variables replaced at deploy time: DOMAIN and the active slot port.
+#
+# NOTE: this is a *site* conf (e.g. /etc/nginx/sites-available/workers-platform.conf).
+# The deploy script only ever rewrites this one file and performs a graceful
+# `nginx -s reload`. It never touches nginx.conf, other sites, or restarts nginx.
+#
+# The app slot publishes 127.0.0.1:<BLUE_PORT|GREEN_PORT> -> 3000, so host nginx
+# proxies to loopback (docker container names are NOT resolvable from host nginx).
 
 upstream workers_platform_app {
-    server __ACTIVE_CONTAINER__:3000;
+    server 127.0.0.1:__ACTIVE_PORT__;
     keepalive 32;
 }
 
@@ -40,12 +47,5 @@ server {
     }
 }
 
-# TLS: run certbot --nginx -d __DOMAIN__ or add a 443 server block:
-#
-# server {
-#     listen 443 ssl http2;
-#     server_name __DOMAIN__;
-#     ssl_certificate     /etc/letsencrypt/live/__DOMAIN__/fullchain.pem;
-#     ssl_certificate_key /etc/letsencrypt/live/__DOMAIN__/privkey.pem;
-#     ... (same proxy_pass block as above)
-# }
+# TLS: run certbot --nginx -d <your-domain> or add a 443 server block
+# (same proxy_pass block as above, with your ssl_certificate paths).

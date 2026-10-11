@@ -8,3 +8,10 @@ dist/
 coverage/
 .DS_Store
 data/
+
+# deploy state (host-specific, never commit)
+/deploy/.active-slot
+/deploy/.previous-image
+/deploy/.build.log
+/deploy/nginx.conf.rendered
+/deploy/nginx.conf.rendered.prev
