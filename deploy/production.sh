@@ -41,7 +41,7 @@ RENDERED_FILE="${SCRIPT_DIR}/nginx.conf.rendered"
 
 BLUE_CONTAINER="workers-app-blue"
 GREEN_CONTAINER="workers-app-green"
-NETWORK="workers-network"
+NETWORK="workers-network"  # default; resolve_network() refines it at runtime
 INTERNAL_PORT="3000"   # port the app listens on INSIDE every slot container
 NO_RELOAD=0
 
@@ -80,6 +80,8 @@ Environment:
                               (default: http://127.0.0.1/health)
   HEALTH_TIMEOUT              seconds to wait for the new slot (default: 180)
   BACKUP_RETENTION            how many recent backups to keep (default: 14)
+  DOCKER_NETWORK              docker network for slots (default: auto-detected
+                              from the postgres container)
 EOF
 }
 
@@ -116,6 +118,19 @@ green_port() { echo "${GREEN_PORT:-3200}"; }
 container_for_slot() { case "$1" in blue) echo "$BLUE_CONTAINER" ;; green) echo "$GREEN_CONTAINER" ;; *) die "unknown slot: $1" ;; esac; }
 port_for_slot()      { case "$1" in blue) blue_port ;; green) green_port ;; *) die "unknown slot: $1" ;; esac; }
 other_slot()         { case "$1" in blue) echo green ;; green) echo blue ;; *) die "unknown slot: $1" ;; esac; }
+
+resolve_network() {
+  # docker compose prefixes network names with the project name
+  # (e.g. myproj_workers-network), so reuse the network postgres actually
+  # lives on instead of assuming a hardcoded name.
+  # Explicit override wins: DOCKER_NETWORK=foo ./deploy/production.sh deploy
+  if [[ -n "${DOCKER_NETWORK:-}" ]]; then echo "$DOCKER_NETWORK"; return 0; fi
+  local net
+  net="$(docker container inspect workers-postgres \
+    --format '{{range $k, $v := .NetworkSettings.Networks}}{{println $k}}{{end}}' 2>/dev/null \
+    | grep -vxE 'bridge|host|none' | head -n 1 || true)"
+  if [[ -n "${net:-}" ]]; then echo "$net"; else echo "$NETWORK"; fi
+}
 
 # Port the app listens on inside a running slot container (default 3000).
 container_port() {
@@ -166,6 +181,8 @@ preflight() {
   }
 
   log "preflight: checking deploy prerequisites..."
+  NETWORK="$(resolve_network)"
+  log "preflight: using docker network $NETWORK"
 
   check "docker daemon reachable" docker info
   [[ -f "${SCRIPT_DIR}/nginx.conf.template" ]] \
@@ -197,7 +214,7 @@ preflight() {
   done
   docker network inspect "$NETWORK" >/dev/null 2>&1 \
     && log "preflight ok: network $NETWORK exists" \
-    || { err "preflight FAIL: network $NETWORK missing (docker compose up -d)"; failures=$((failures + 1)); }
+    || { err "preflight FAIL: network $NETWORK missing (override with DOCKER_NETWORK=<name>)"; failures=$((failures + 1)); }
 
   # S3 backup prerequisites (unless explicitly skipped).
   if [[ "${SKIP_BACKUP:-0}" == "1" ]]; then
