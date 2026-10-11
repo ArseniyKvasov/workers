@@ -394,8 +394,8 @@ render_nginx_conf() {
     local snippet="${SCRIPT_DIR}/nginx.tls-snippet.template"
     [[ -f "$snippet" ]] || die "nginx TLS snippet not found: $snippet"
     local cert_escaped key_escaped
-    cert_escaped="$(printf '%s' "$cert" | sed -e 's/[\\/&|]/\\&/g')"
-    key_escaped="$(printf '%s' "$key" | sed -e 's/[\\/&|]/\\&/g')"
+    cert_escaped="$(printf '%s' "$cert" | sed -e 's/[\\&|]/\\&/g')"
+    key_escaped="$(printf '%s' "$key" | sed -e 's/[\\&|]/\\&/g')"
     sed -e "s|__DOMAIN__|${domain_escaped}|g" \
         -e "s|__ACTIVE_PORT__|${active_port}|g" \
         -e "s|__TLS_CERT__|${cert_escaped}|g" \
