@@ -650,6 +650,7 @@ cmd_deploy() {
   local incoming_image="${1:-}"
 
   preflight
+  ensure_database
   do_backup
 
   local active="" target
