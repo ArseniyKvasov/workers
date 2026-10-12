@@ -1,4 +1,4 @@
-import { D1Binding, KVBinding, QueueBinding } from "@platform/bindings";
+import { D1Binding, KVBinding, QueueBinding, LogBinding } from "@platform/bindings";
 import type { Redis } from "ioredis";
 import type { Client as LibSQLClient } from "@libsql/client";
 
@@ -30,6 +30,7 @@ interface Envelope {
 const d1Bindings = new Map<string, D1Binding>();
 const kvBindings = new Map<string, KVBinding>();
 const queueBindings = new Map<string, QueueBinding>();
+const logBindings = new Map<string, LogBinding>();
 
 function ok(result: unknown): Response {
   return Response.json({ ok: true, result });
@@ -44,6 +45,7 @@ export function createBindingServices(workerId: string, options: BindingServiceO
   d1: ServiceHandler;
   kv: ServiceHandler;
   queue: ServiceHandler;
+  logs: ServiceHandler;
   /** Drop cached binding instances for this worker (on reload). */
   dispose: () => void;
 } {
@@ -78,6 +80,16 @@ export function createBindingServices(workerId: string, options: BindingServiceO
     if (!binding) {
       binding = new QueueBinding(workerId, name, options.redis, {}, { onSend: hooks.onQueueSend });
       queueBindings.set(cacheKey, binding);
+    }
+    return binding;
+  }
+
+  function logsFor(): LogBinding {
+    const cacheKey = `${workerId}:logs`;
+    let binding = logBindings.get(cacheKey);
+    if (!binding) {
+      binding = new LogBinding(workerId, options.redis, { maxLen: 100_000 });
+      logBindings.set(cacheKey, binding);
     }
     return binding;
   }
@@ -171,14 +183,49 @@ export function createBindingServices(workerId: string, options: BindingServiceO
     }
   }
 
+  async function logsHandler(request: Request): Promise<Response> {
+    try {
+      const { op, payload } = (await request.json()) as Envelope;
+      const binding = logsFor();
+
+      switch (op) {
+        case "logs.write": {
+          const p = payload as Record<string, unknown>;
+          const entry = {
+            timestamp: (p.timestamp as string) ?? new Date().toISOString(),
+            level: (p.level as "info" | "warn" | "error") ?? "info",
+            method: (p.method as string) ?? "LOG",
+            path: (p.path as string) ?? "/",
+            status: (p.status as number) ?? 0,
+            latencyMs: (p.latencyMs as number) ?? 0,
+            requestSize: (p.requestSize as number) ?? 0,
+            responseSize: (p.responseSize as number) ?? 0,
+            clientIp: (p.clientIp as string) ?? "worker",
+            workerId: (p.workerId as string) ?? "",
+            error: p.error as string | undefined,
+            traceId: p.traceId as string | undefined,
+          };
+          await binding.write(entry);
+          return ok({ written: true });
+        }
+        default:
+          return fail(new Error(`unknown Logs op "${op}"`));
+      }
+    } catch (error) {
+      return fail(error);
+    }
+  }
+
   return {
     d1: d1Handler,
     kv: kvHandler,
     queue: queueHandler,
+    logs: logsHandler,
     dispose: () => {
       for (const key of [...d1Bindings.keys()]) if (key.startsWith(`${workerId}:`)) d1Bindings.delete(key);
       for (const key of [...kvBindings.keys()]) if (key.startsWith(`${workerId}:`)) kvBindings.delete(key);
       for (const key of [...queueBindings.keys()]) if (key.startsWith(`${workerId}:`)) queueBindings.delete(key);
+      for (const key of [...logBindings.keys()]) if (key.startsWith(`${workerId}:`)) logBindings.delete(key);
     },
   };
 }

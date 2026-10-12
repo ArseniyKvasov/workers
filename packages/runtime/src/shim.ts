@@ -26,6 +26,22 @@ interface BindingsJson {
   queues?: string[];
 }
 
+/** Log entry structure for forwarding console logs */
+interface LogEntry {
+  timestamp: string;
+  level: "info" | "warn" | "error";
+  method: string;
+  path: string;
+  status: number;
+  latencyMs: number;
+  requestSize: number;
+  responseSize: number;
+  clientIp: string;
+  workerId: string;
+  error?: string;
+  traceId?: string;
+}
+
 async function callService(
   service: ServiceLike | undefined,
   name: string,
@@ -160,6 +176,82 @@ function buildUserEnv(rawEnv: Record<string, unknown>): Record<string, unknown> 
   const secretValues = parseJson(rawEnv["__SECRETS"]) as Record<string, string>;
   env["SECRETS"] = {
     get: (name: string): string | null => secretValues[name] ?? null,
+  };
+
+  // Inject LOGS binding for console forwarding
+  const logsService = rawEnv["__LOGS"] as ServiceLike | undefined;
+  if (logsService) {
+    env["LOGS"] = {
+      async write(entry: LogEntry): Promise<void> {
+        await callService(logsService, "logs", "logs.write", { ...entry, workerId: entry.workerId ?? rawEnv["__WORKER_ID"] as string });
+      },
+    };
+  }
+
+  // Override console.log/console.error to forward to LOGS
+  const originalLog = console.log;
+  const originalError = console.error;
+  const workerId = rawEnv["__WORKER_ID"] as string | undefined ?? "unknown";
+
+  env["console"] = {
+    log: (...args: unknown[]) => {
+      originalLog(...args);
+      const entry: LogEntry = {
+        timestamp: new Date().toISOString(),
+        level: "info",
+        method: "LOG",
+        path: "/",
+        status: 0,
+        latencyMs: 0,
+        requestSize: 0,
+        responseSize: 0,
+        clientIp: "worker",
+        workerId,
+        error: undefined,
+      };
+      // Fire and forget - don't await
+      if (logsService) {
+        callService(logsService, "logs", "logs.write", { ...entry, method: "LOG", path: args.map(String).join(" ") }).catch(() => {});
+      }
+    },
+    error: (...args: unknown[]) => {
+      originalError(...args);
+      const entry: LogEntry = {
+        timestamp: new Date().toISOString(),
+        level: "error",
+        method: "LOG",
+        path: "/",
+        status: 0,
+        latencyMs: 0,
+        requestSize: 0,
+        responseSize: 0,
+        clientIp: "worker",
+        workerId,
+        error: args.map(String).join(" "),
+      };
+      if (logsService) {
+        callService(logsService, "logs", "logs.write", { ...entry, method: "LOG", path: args.map(String).join(" ") }).catch(() => {});
+      }
+    },
+    warn: (...args: unknown[]) => {
+      console.warn(...args);
+      const entry: LogEntry = {
+        timestamp: new Date().toISOString(),
+        level: "warn",
+        method: "LOG",
+        path: "/",
+        status: 0,
+        latencyMs: 0,
+        requestSize: 0,
+        responseSize: 0,
+        clientIp: "worker",
+        workerId,
+        error: undefined,
+      };
+      if (logsService) {
+        callService(logsService, "logs", "logs.write", { ...entry, method: "LOG", path: args.map(String).join(" ") }).catch(() => {});
+      }
+    },
   };
 
   return env;

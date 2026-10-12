@@ -62,7 +62,7 @@ interface WorkerIsolate {
   mf: Miniflare;
   versionId: string;
   concurrency: number;
-  services: { d1: ServiceHandler; kv: ServiceHandler; queue: ServiceHandler; dispose: () => void };
+  services: { d1: ServiceHandler; kv: ServiceHandler; queue: ServiceHandler; logs: ServiceHandler; dispose: () => void };
   inFlight: number;
   draining: boolean;
 }
@@ -167,11 +167,13 @@ export class IsolateManager {
           bindings: {
             __SECRETS: JSON.stringify(input.secrets),
             __BINDINGS: JSON.stringify(input.bindings),
+            __WORKER_ID: input.workerId,
           },
           serviceBindings: {
             __D1: services.d1,
             __KV: services.kv,
             __QUEUE: services.queue,
+            __LOGS: services.logs,
           },
           compatibilityFlags: ["nodejs_compat"],
           limits: {

@@ -415,6 +415,58 @@ paths:
           schema: { type: integer, default: 0 }
       responses:
         '200': { description: Versions list }
+  /api/workers/{id}/versions/{versionId}/code:
+    get:
+      tags: [management]
+      summary: Get source code of a specific version
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: versionId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Version source code and manifest
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      code: { type: string, description: "Original source code" }
+                      manifest: { $ref: '#/components/schemas/VersionPayload/properties/manifest' }
+        '404': { description: Version not found }
+  /api/workers/{id}/code:
+    get:
+      tags: [management]
+      summary: Get source code of currently promoted (production) version
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Current production version source code and manifest (null if no version promoted)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      code: { type: string, nullable: true, description: "Original source code, or null if no promoted version" }
+                      manifest: { nullable: true, description: "Manifest of promoted version, or null" }
+        '404': { description: Worker not found }
   /api/workers/{id}/versions/{versionId}/promote:
     post:
       tags: [management]
@@ -481,15 +533,63 @@ paths:
   /api/workers/{id}/logs:
     get:
       tags: [management]
-      summary: SSE log stream
+      summary: Get request logs for a worker (with filters)
       security: [{ BearerAuth: [] }]
       parameters:
         - name: id
           in: path
           required: true
           schema: { type: string, format: uuid }
+        - name: since
+          in: query
+          schema: { type: string, format: date-time }
+          description: Start time (inclusive)
+        - name: until
+          in: query
+          schema: { type: string, format: date-time }
+          description: End time (exclusive)
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+        - name: level
+          in: query
+          schema: { type: string, enum: [info, warn, error] }
+          description: Minimum log level
+        - name: cursor
+          in: query
+          schema: { type: string }
+          description: Pagination cursor (stream entry ID)
       responses:
-        '200': { description: SSE stream of logs }
+        '200':
+          description: Paginated log entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      entries:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            timestamp: { type: string, format: date-time }
+                            level: { type: string, enum: [info, warn, error] }
+                            method: { type: string }
+                            path: { type: string }
+                            status: { type: integer }
+                            latencyMs: { type: integer }
+                            requestSize: { type: integer }
+                            responseSize: { type: integer }
+                            clientIp: { type: string }
+                            workerId: { type: string, format: uuid }
+                            error: { type: string }
+                            traceId: { type: string }
+                      nextCursor: { type: string }
+                      hasMore: { type: boolean }
+        '404': { description: Worker not found }
   /api/d1:
     post:
       tags: [management]
