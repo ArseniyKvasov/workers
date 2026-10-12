@@ -17,11 +17,7 @@ async function main() {
   try {
     await db.execute(sql`CREATE EXTENSION IF NOT EXISTS pgcrypto`);
 
-    // Legacy schema convergence: drop the removed worker name column/index.
-    await db.execute(sql`ALTER TABLE workers DROP COLUMN IF EXISTS name`);
-    await db.execute(sql`DROP INDEX IF EXISTS workers_name_uq`);
-
-    
+    // Create all tables first (idempotent)
     await db.execute(sql`
       CREATE TABLE IF NOT EXISTS workers (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -33,6 +29,11 @@ async function main() {
       )
     `);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS workers_status_idx ON workers (status)`);
+
+    // Legacy schema convergence: drop the removed worker name column/index.
+    // Use ALTER TABLE IF EXISTS (PostgreSQL 9.5+) so it works on fresh DBs.
+    await db.execute(sql`ALTER TABLE IF EXISTS workers DROP COLUMN IF EXISTS name`);
+    await db.execute(sql`DROP INDEX IF EXISTS workers_name_uq`);
 
     await db.execute(sql`
       CREATE TABLE IF NOT EXISTS worker_versions (
