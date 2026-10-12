@@ -530,12 +530,32 @@ build_image() {
   echo "$tag"
 }
 
+# Ensure the target database exists (connects to default 'postgres' DB)
+ensure_database() {
+  local db_name="${POSTGRES_DB:-workers_platform}"
+  log "ensure_database: checking if '${db_name}' exists"
+  if docker run --rm --network "$NETWORK" \
+      -e PGPASSWORD="${POSTGRES_PASSWORD:-postgres}" \
+      postgres:16-alpine \
+      psql -h postgres -U "${POSTGRES_USER:-postgres}" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${db_name}'" 2>/dev/null | grep -q 1; then
+    log "ensure_database: '${db_name}' already exists"
+  else
+    log "ensure_database: creating '${db_name}'"
+    docker run --rm --network "$NETWORK" \
+      -e PGPASSWORD="${POSTGRES_PASSWORD:-postgres}" \
+      postgres:16-alpine \
+      psql -h postgres -U "${POSTGRES_USER:-postgres}" -d postgres -c "CREATE DATABASE ${db_name}" >&2
+    log "ensure_database: created '${db_name}'"
+  fi
+}
+
 run_migrations() {
   local image="$1"
   if [[ "${SKIP_MIGRATE:-0}" == "1" ]]; then
     warn "SKIP_MIGRATE=1 — skipping DB migrations"
     return 0
   fi
+  ensure_database
   log "migrations: applying from image ${image} (backup already taken)"
   if docker run --rm --network "$NETWORK" \
       -e DATABASE_URL="postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-workers_platform}" \
