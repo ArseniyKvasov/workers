@@ -17,7 +17,7 @@ import {
   WorkersRepository,
 } from "@platform/catalog";
 import { IsolateManager } from "@platform/runtime";
-import { SecretCrypto } from "@platform/bindings";
+import { SecretCrypto, LogBinding } from "@platform/bindings";
 import { HealthService, createLogger, getMetrics } from "@platform/observability";
 import {
   buildApp,
@@ -85,6 +85,9 @@ async function main() {
   const libsql = createClient({ url: `file:${libsqlDir}/platform.db` });
 
   const secretCrypto = new SecretCrypto(config.secretsMasterKey);
+
+  // --- Log binding -----------------------------------------------------------
+  const logs = new LogBinding("system", redis, { maxLen: 100_000 });
 
   // --- Repositories --------------------------------------------------------
   const repositories = {
@@ -176,10 +179,14 @@ async function main() {
       isolates,
       secretCrypto,
       dataDir: config.dataDir,
+      logs,
     }),
     logger,
+    logs,
     scanIntervalMs: 30_000,
     batchSize: 100,
+    logRetentionIntervalMs: intEnv("LOG_RETENTION_INTERVAL_MS", 60 * 60 * 1000), // 1 hour
+    logRetentionSeconds: intEnv("LOG_RETENTION_SECONDS", 7 * 24 * 60 * 60), // 7 days
   });
   cronScheduler.start();
 

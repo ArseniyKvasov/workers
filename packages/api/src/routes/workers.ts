@@ -3,6 +3,7 @@ import type { WorkersService } from "../services/workers-service.js";
 import { badRequest } from "../errors.js";
 import { workerCreateSchema, workerUpdateSchema, invokeSchema } from "@platform/types";
 import { readBodyCapped } from "../body-limit.js";
+import { LogBinding, type LogQuery } from "@platform/bindings";
 
 function serializeWorker(w: {
   id: string;
@@ -22,7 +23,7 @@ function serializeWorker(w: {
   };
 }
 
-export function workersRoutes(deps: { workersService: WorkersService; maxBodyBytes: number }): Hono {
+export function workersRoutes(deps: { workersService: WorkersService; maxBodyBytes: number; logs: LogBinding }): Hono {
   const app = new Hono();
 
   // --- Workers CRUD -------------------------------------------------------
@@ -165,45 +166,22 @@ export function workersRoutes(deps: { workersService: WorkersService; maxBodyByt
     return c.json({ data: { period: { from: from.toISOString(), to: to.toISOString() }, summary } });
   });
 
-  // --- Logs (SSE) ----------------------------------------------------------
-  app.get("/workers/:id/logs", (c) => {
+  // --- Logs (REST) ----------------------------------------------------------
+  app.get("/workers/:id/logs", async (c) => {
     const workerId = c.req.param("id");
-    const since = c.req.query("since") ?? "";
+    await deps.workersService.getWorker(workerId); // validate worker exists
 
-    const stream = new ReadableStream({
-      async start(controller) {
-        const encoder = new TextEncoder();
-        const send = (event: string, data: unknown) => {
-          controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
-        };
+    const query: LogQuery = {
+      since: c.req.query("since"),
+      until: c.req.query("until"),
+      limit: c.req.query("limit") ? Math.min(Number(c.req.query("limit")!), 1000) : 100,
+      level: c.req.query("level") as "info" | "warn" | "error" | undefined,
+      cursor: c.req.query("cursor"),
+    };
 
-        send("open", { worker_id: workerId, since });
-
-        // Poll usage-based heartbeat until client disconnects
-        const interval = setInterval(() => {
-          try {
-            send("heartbeat", { ts: new Date().toISOString() });
-          } catch {
-            clearInterval(interval);
-          }
-        }, 15_000);
-
-        c.req.raw.signal.addEventListener("abort", () => {
-          clearInterval(interval);
-          try {
-            controller.close();
-          } catch {
-            // already closed
-          }
-        });
-      },
-    });
-
-    c.header("content-type", "text/event-stream");
-    c.header("cache-control", "no-cache");
-    c.header("connection", "keep-alive");
-    return c.body(stream);
+    const result = await deps.logs.read(query);
+    return c.json({ data: result });
   });
 
-    return app;
+  return app;
 }

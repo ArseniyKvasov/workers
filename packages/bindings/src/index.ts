@@ -4,6 +4,7 @@ import { D1Binding } from "./d1.js";
 import { KVBinding } from "./kv.js";
 import { QueueBinding } from "./queue.js";
 import { SecretCrypto, SecretsBinding } from "./secrets.js";
+import { LogBinding, createLogBinding, type LogEntry, type LogQuery, type LogBatch } from "./logs.js";
 
 /** All resource hooks shared by bindings for metering/observability. */
 export interface BindingHooks {
@@ -12,6 +13,7 @@ export interface BindingHooks {
   onKvOp?: (workerId: string, op: string) => void;
   onQueueSend?: (workerId: string) => void;
   onSecretOp?: (workerId: string, op: string) => void;
+  onLogWrite?: (workerId: string, entry: LogEntry) => void;
 }
 
 export interface BindingDependencies {
@@ -30,6 +32,7 @@ export interface WorkerBindings {
   kv: (name: string) => KVBinding;
   queue: (name: string) => QueueBinding;
   secrets: () => SecretsBinding;
+  logs: () => LogBinding;
 }
 
 export function createBindings(workerId: string, deps: BindingDependencies): WorkerBindings {
@@ -47,7 +50,9 @@ export function createBindings(workerId: string, deps: BindingDependencies): Wor
       new SecretsBinding(workerId, deps.secretCrypto, deps.secretLoader, {
         onOp: hooks.onSecretOp,
       }),
+    logs: () => createLogBinding(workerId, deps.redis, { maxLen: 100_000 }),
   };
 }
 
 export { D1Binding, KVBinding, QueueBinding, SecretCrypto, SecretsBinding };
+export { LogBinding, createLogBinding, type LogEntry, type LogQuery, type LogBatch } from "./logs.js";

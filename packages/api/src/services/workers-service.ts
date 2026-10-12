@@ -12,8 +12,25 @@ import type {
 } from "@platform/catalog";
 import type { IsolateManager } from "@platform/runtime";
 import type { SecretCrypto } from "@platform/bindings";
+import type { LogBinding, LogEntry } from "@platform/bindings";
 import { DEFAULT_LIMITS, PLATFORM_LIMITS, DEPLOY_CODE_MAX_BYTES, type Manifest } from "@platform/types";
 import { notFound, payloadTooLarge, limitExceeded, HttpError } from "../errors.js";
+
+export interface WorkersServiceDeps {
+  workers: WorkersRepository;
+  versions: VersionsRepository;
+  bindingsRepo: BindingsRepository;
+  secretsRepo: SecretsRepository;
+  d1Catalog: D1CatalogRepository;
+  kvCatalog: KVCatalogRepository,
+  queuesCatalog: QueuesCatalogRepository,
+  usage: UsageRepository;
+  isolates: IsolateManager;
+  secretCrypto: SecretCrypto;
+  dataDir: string;
+  /** Log binding for writing request logs */
+  logs: LogBinding;
+}
 
 export interface WorkersServiceDeps {
   workers: WorkersRepository;
@@ -237,6 +254,7 @@ export class WorkersService {
     if (!this.deps.isolates.isDeployed(workerId)) {
       throw notFound(`deployed worker "${workerId}" — promote a version first`);
     }
+    const startedAt = Date.now();
     const result = await this.deps.isolates.invoke({
       workerId,
       method: input.method,
@@ -245,11 +263,27 @@ export class WorkersService {
       headers: input.headers,
       body: input.body,
     });
+    const latencyMs = Date.now() - startedAt;
 
     await this.deps.usage.recordSample(workerId, {
       requestsCount: 1,
       errorsCount: result.status >= 500 ? 1 : 0,
       cpuMsTotal: result.metrics.cpuMs,
+    });
+
+    // Write request log
+    await this.writeLog({
+      timestamp: new Date().toISOString(),
+      level: result.status >= 500 ? "error" : result.status >= 400 ? "warn" : "info",
+      method: input.method,
+      path: input.path,
+      status: result.status,
+      latencyMs,
+      requestSize: input.body?.length ?? 0,
+      responseSize: result.bodyText?.length ?? 0,
+      clientIp: "api-invoke",
+      workerId,
+      error: result.status >= 500 ? `HTTP ${result.status}` : undefined,
     });
 
     // JSON API returns UTF-8 text (binary responses are not representable here).
@@ -276,6 +310,7 @@ export class WorkersService {
       throw notFound(`deployed worker "${workerId}" — promote a version first`);
     }
 
+    const startedAt = Date.now();
     const result = await this.deps.isolates.invoke({
       workerId,
       method: input.method,
@@ -284,6 +319,7 @@ export class WorkersService {
       headers: input.headers,
       body: input.body,
     });
+    const latencyMs = Date.now() - startedAt;
 
     await this.deps.usage.recordSample(workerId, {
       requestsCount: 1,
@@ -291,7 +327,31 @@ export class WorkersService {
       cpuMsTotal: result.metrics.cpuMs,
     });
 
+    // Write request log
+    await this.writeLog({
+      timestamp: new Date().toISOString(),
+      level: result.status >= 500 ? "error" : result.status >= 400 ? "warn" : "info",
+      method: input.method,
+      path: input.path,
+      status: result.status,
+      latencyMs,
+      requestSize: input.body instanceof Uint8Array ? input.body.byteLength : (input.body?.length ?? 0),
+      responseSize: result.body instanceof Uint8Array ? result.body.byteLength : (result.bodyText?.length ?? 0),
+      clientIp: "ingress",
+      workerId,
+      error: result.status >= 500 ? `HTTP ${result.status}` : undefined,
+    });
+
     return { workerId, status: result.status, body: result.body, headers: result.headers };
+  }
+
+  private async writeLog(entry: LogEntry): Promise<void> {
+    try {
+      await this.deps.logs.write(entry);
+    } catch (err) {
+      // Log write failures must not break the request
+      console.error("[log] write failed:", err);
+    }
   }
 
   d1FilePath(workerId: string, name: string): string {

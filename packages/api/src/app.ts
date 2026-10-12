@@ -22,6 +22,7 @@ import { d1Routes, kvRoutes, queuesRoutes } from "./routes/resources.js";
 import { secretsRoutes } from "./routes/secrets.js";
 import { apiKeyRoutes } from "./routes/api-keys.js";
 import { cronRoutes } from "./routes/cron.js";
+import { LogBinding } from "@platform/bindings";
 import type {
   WorkersRepository,
   VersionsRepository,
@@ -122,6 +123,7 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
     isolates: deps.isolates,
     secretCrypto: deps.secretCrypto,
     dataDir: deps.config.dataDir,
+    logs: new LogBinding("system", deps.redis, { maxLen: 100_000 }),
   });
 
   // --- Global middleware ---------------------------------------------------
@@ -324,7 +326,8 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
 
   // --- API routes -------------------------------------------------------------
   const api = new Hono();
-  api.route("/", workersRoutes({ workersService, maxBodyBytes: deps.config.maxBodyBytes }));
+  const logs = new LogBinding("system", deps.redis, { maxLen: 100_000 });
+  api.route("/", workersRoutes({ workersService, maxBodyBytes: deps.config.maxBodyBytes, logs }));
   api.route("/", d1Routes({ workersService, d1Catalog: deps.repositories.d1Catalog }));
   api.route("/", kvRoutes({ workersService, kvCatalog: deps.repositories.kvCatalog, redis: deps.redis }));
   api.route("/", queuesRoutes({ workersService, queuesCatalog: deps.repositories.queuesCatalog, redis: deps.redis }));

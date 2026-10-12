@@ -1,21 +1,29 @@
 import type { CronJobsRepository } from "@platform/catalog";
 import type { WorkersService } from "../services/workers-service.js";
 import type { Logger } from "@platform/observability";
+import type { LogBinding } from "@platform/bindings";
 import { getNextRunTime } from "../utils/cron.js";
 
 export interface CronSchedulerDeps {
   cronJobs: CronJobsRepository;
   workersService: WorkersService;
   logger: Logger;
+  /** Log binding for retention cleanup */
+  logs: LogBinding;
   /** How often to scan for due jobs (ms). Default 30s. */
   scanIntervalMs?: number;
   /** Max jobs to process per scan. Default 100. */
   batchSize?: number;
+  /** How often to run log retention cleanup (ms). Default 1 hour. */
+  logRetentionIntervalMs?: number;
+  /** Max age of logs to keep (seconds). Default 7 days. */
+  logRetentionSeconds?: number;
 }
 
 export class CronScheduler {
   private readonly deps: Required<CronSchedulerDeps>;
   private timer: NodeJS.Timeout | null = null;
+  private logRetentionTimer: NodeJS.Timeout | null = null;
   private running = false;
 
   constructor(deps: CronSchedulerDeps) {
@@ -23,8 +31,11 @@ export class CronScheduler {
       cronJobs: deps.cronJobs,
       workersService: deps.workersService,
       logger: deps.logger,
+      logs: deps.logs,
       scanIntervalMs: deps.scanIntervalMs ?? 30_000,
       batchSize: deps.batchSize ?? 100,
+      logRetentionIntervalMs: deps.logRetentionIntervalMs ?? 60 * 60 * 1000, // 1 hour
+      logRetentionSeconds: deps.logRetentionSeconds ?? 7 * 24 * 60 * 60, // 7 days
     };
   }
 
@@ -34,6 +45,14 @@ export class CronScheduler {
     this.deps.logger.info({ intervalMs: this.deps.scanIntervalMs }, "cron scheduler started");
     this.tick();
     this.timer = setInterval(() => this.tick(), this.deps.scanIntervalMs);
+
+    // Start log retention cleanup
+    this.deps.logger.info({ 
+      intervalMs: this.deps.logRetentionIntervalMs, 
+      retentionSeconds: this.deps.logRetentionSeconds 
+    }, "log retention cleanup started");
+    this.cleanupLogs();
+    this.logRetentionTimer = setInterval(() => this.cleanupLogs(), this.deps.logRetentionIntervalMs);
   }
 
   stop(): void {
@@ -42,7 +61,24 @@ export class CronScheduler {
       clearInterval(this.timer);
       this.timer = null;
     }
+    if (this.logRetentionTimer) {
+      clearInterval(this.logRetentionTimer);
+      this.logRetentionTimer = null;
+    }
     this.deps.logger.info("cron scheduler stopped");
+  }
+
+  private async cleanupLogs(): Promise<void> {
+    if (!this.running) return;
+    try {
+      const olderThan = new Date(Date.now() - this.deps.logRetentionSeconds * 1000);
+      const removed = await this.deps.logs.trimByTime(olderThan);
+      if (removed > 0) {
+        this.deps.logger.info({ removed, olderThan: olderThan.toISOString() }, "log retention: trimmed old entries");
+      }
+    } catch (error) {
+      this.deps.logger.error({ error: String(error) }, "log retention cleanup failed");
+    }
   }
 
   private async tick(): Promise<void> {
