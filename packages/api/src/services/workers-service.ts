@@ -218,6 +218,22 @@ export class WorkersService {
     if (!deleted) throw notFound("non-promoted version", versionId);
   }
 
+  /** Get source code of a specific version. */
+  async getVersionCode(workerId: string, versionId: string): Promise<{ code: string; manifest: Manifest }> {
+    await this.getWorker(workerId);
+    const version = await this.deps.versions.find(versionId);
+    if (!version || version.workerId !== workerId) throw notFound("version", versionId);
+    return { code: version.code, manifest: version.manifest as Manifest };
+  }
+
+  /** Get source code of the currently promoted (production) version. */
+  async getCurrentCode(workerId: string): Promise<{ code: string; manifest: Manifest } | null> {
+    await this.getWorker(workerId);
+    const promoted = await this.deps.versions.findPromoted(workerId);
+    if (!promoted) return null;
+    return { code: promoted.code, manifest: promoted.manifest as Manifest };
+  }
+
   private async deployStored(workerId: string, version: { id: string; code: string; manifest: unknown }) {
     const worker = await this.getWorker(workerId);
     const manifest = version.manifest as Manifest;

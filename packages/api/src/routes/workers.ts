@@ -143,6 +143,18 @@ export function workersRoutes(deps: { workersService: WorkersService; maxBodyByt
     return c.json({ data: { deleted: true } });
   });
 
+  // --- Version code access --------------------------------------------------
+  app.get("/workers/:id/versions/:versionId/code", async (c) => {
+    const { code, manifest } = await deps.workersService.getVersionCode(c.req.param("id"), c.req.param("versionId"));
+    return c.json({ data: { code, manifest } });
+  });
+
+  app.get("/workers/:id/code", async (c) => {
+    const result = await deps.workersService.getCurrentCode(c.req.param("id"));
+    if (!result) return c.json({ data: { code: null, manifest: null } });
+    return c.json({ data: result });
+  });
+
   // --- Invoke (sync testing) ----------------------------------------------
   app.post("/workers/:id/invoke", async (c) => {
     const parsed = invokeSchema.safeParse(await c.req.json());
