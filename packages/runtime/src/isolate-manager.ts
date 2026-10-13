@@ -209,13 +209,20 @@ export class IsolateManager {
         url.searchParams.set(key, value);
       }
 
+      // GET/HEAD/OPTIONS requests must not have a body per HTTP spec
+      const noBodyMethods = new Set(["GET", "HEAD", "OPTIONS"]);
+      const hasBody = input.body !== undefined &&
+        input.body !== "" &&
+        !(input.body instanceof Uint8Array && input.body.byteLength === 0);
+      const requestBody = hasBody && !noBodyMethods.has(input.method.toUpperCase()) ? input.body : undefined;
+
       const response = await isolate.mf.dispatchFetch(url.toString(), {
         method: input.method,
         headers: {
           ...(input.headers ?? {}),
           "x-platform-request-id": requestId,
         },
-        body: input.body,
+        body: requestBody,
       } as unknown as Parameters<typeof isolate.mf.dispatchFetch>[1]);
       const body = new Uint8Array(await response.arrayBuffer());
 
