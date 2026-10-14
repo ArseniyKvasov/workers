@@ -1,6 +1,7 @@
 import { createClient } from "@libsql/client";
 import { Redis } from "ioredis";
-import { mkdir } from "node:fs/promises";
+import { access, mkdir, unlink, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { join } from "node:path";
 import {
   createCatalogDb,
@@ -15,10 +16,11 @@ import {
   UsageRepository,
   VersionsRepository,
   WorkersRepository,
+  type CatalogDb,
 } from "@platform/catalog";
 import { IsolateManager } from "@platform/runtime";
 import { SecretCrypto, LogBinding } from "@platform/bindings";
-import { HealthService, createLogger, getMetrics } from "@platform/observability";
+import { HealthService, createLogger, getMetrics, type Logger } from "@platform/observability";
 import {
   buildApp,
   serveApp,
@@ -70,18 +72,156 @@ function loadConfig(): AppConfig {
   };
 }
 
+/**
+ * Static (no I/O to pg/redis) config validation. Throws with an actionable
+ * message so `docker logs` tells exactly which env var is wrong instead of
+ * surfacing later as "auth stopped working".
+ */
+function preflightStaticConfig(config: AppConfig, logger: Logger): void {
+  // DATABASE_URL must at least parse as a postgres URL.
+  let parsed: URL;
+  try {
+    parsed = new URL(config.databaseUrl);
+  } catch {
+    throw new Error(
+      "preflight FAIL: DATABASE_URL is not a valid URL. " +
+        "Expected e.g. postgresql://postgres:<password>@postgres:5432/workers_platform " +
+        "(if the password contains @ / : ? # % it must be percent-encoded — see deploy/docker-entrypoint.sh)"
+    );
+  }
+  if (!/^postgres(ql)?:$/.test(parsed.protocol)) {
+    throw new Error(`preflight FAIL: DATABASE_URL scheme must be postgresql:// (got "${parsed.protocol}//")`);
+  }
+  if (!parsed.password) {
+    throw new Error("preflight FAIL: DATABASE_URL has no password — postgres auth will fail");
+  }
+
+  // SECRETS_MASTER_KEY must decode to exactly 32 bytes (AES-256).
+  const keyBytes = Buffer.from(config.secretsMasterKey, "base64");
+  if (keyBytes.length !== 32) {
+    throw new Error(
+      `preflight FAIL: SECRETS_MASTER_KEY must be 32 bytes base64-encoded (got ${keyBytes.length} bytes). ` +
+        "Generate one with: openssl rand -base64 32"
+    );
+  }
+
+  if (!config.apiKey) {
+    logger.warn("preflight: API_KEY is not set — every /api/* request will 401 until a key is configured");
+  }
+
+  if (!Number.isFinite(config.port) || config.port < 1 || config.port > 65535) {
+    throw new Error(`preflight FAIL: PORT must be 1-65535 (got "${process.env.PORT ?? "3000"}")`);
+  }
+}
+
+/** Wait until postgres answers SELECT 1 (bounded retries, clear logs). */
+async function waitForPostgres(
+  db: CatalogDb,
+  logger: Logger,
+  opts: { attempts?: number; intervalMs?: number } = {}
+): Promise<void> {
+  const attempts = opts.attempts ?? Number(process.env.PREFLIGHT_PG_ATTEMPTS ?? 30);
+  const intervalMs = opts.intervalMs ?? Number(process.env.PREFLIGHT_PG_INTERVAL_MS ?? 2000);
+  let lastError = "";
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      await db.execute("SELECT 1");
+      logger.info({ attempts: i }, "preflight: postgres reachable");
+      return;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      if (i === 1 || i % 5 === 0 || i === attempts) {
+        logger.warn({ attempt: `${i}/${attempts}`, error: lastError }, "preflight: waiting for postgres...");
+      }
+      if (i < attempts) await new Promise((r) => setTimeout(r, intervalMs));
+    }
+  }
+  throw new Error(
+    `preflight FAIL: postgres not reachable after ${attempts} attempts: ${lastError}. ` +
+      "Check DATABASE_URL (host, user, percent-encoded password) and that postgres is healthy."
+  );
+}
+
+/** Wait until redis answers PING (bounded retries, clear logs). */
+async function waitForRedis(
+  redis: Redis,
+  logger: Logger,
+  opts: { attempts?: number; intervalMs?: number } = {}
+): Promise<void> {
+  const attempts = opts.attempts ?? Number(process.env.PREFLIGHT_REDIS_ATTEMPTS ?? 30);
+  const intervalMs = opts.intervalMs ?? Number(process.env.PREFLIGHT_REDIS_INTERVAL_MS ?? 2000);
+  let lastError = "";
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const pong = await redis.ping();
+      if (pong !== "PONG") throw new Error(`unexpected PING reply: ${pong}`);
+      logger.info({ attempts: i }, "preflight: redis reachable");
+      return;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      if (/NOAUTH|WRONGPASS|invalid username-password/i.test(lastError)) {
+        throw new Error(
+          `preflight FAIL: redis auth rejected (${lastError}). ` +
+            "Check REDIS_URL / REDIS_PASSWORD — the app URL must contain the same password as redis --requirepass."
+        );
+      }
+      if (i === 1 || i % 5 === 0 || i === attempts) {
+        logger.warn({ attempt: `${i}/${attempts}`, error: lastError }, "preflight: waiting for redis...");
+      }
+      if (i < attempts) await new Promise((r) => setTimeout(r, intervalMs));
+    }
+  }
+  throw new Error(
+    `preflight FAIL: redis not reachable after ${attempts} attempts: ${lastError}. ` +
+      "Check REDIS_URL (host, port, password) and that redis is healthy."
+  );
+}
+
+/** Ensure the data directory exists and is writable (D1 sqlite + libsql live here). */
+async function verifyDataDirWritable(dataDir: string): Promise<void> {
+  await mkdir(dataDir, { recursive: true });
+  await access(dataDir, fsConstants.W_OK);
+  const probe = join(dataDir, ".write-probe");
+  await writeFile(probe, "ok");
+  await unlink(probe).catch(() => {});
+}
+
 async function main() {
+  const startedAt = Date.now();
   const config = loadConfig();
   const logger = createLogger({ base: { service: "control-plane" } });
 
+  // --- Startup preflight -----------------------------------------------------
+  // Fail fast with a CLEAR message instead of serving a half-dead API whose
+  // /api/* auth mysteriously 401/500s minutes later. Every check below used
+  // to be an observed production failure mode.
+  preflightStaticConfig(config, logger);
+
   // --- Infrastructure ------------------------------------------------------
-  const { db, pool } = createCatalogDb({ databaseUrl: config.databaseUrl });
+  const { db, pool } = createCatalogDb({
+    databaseUrl: config.databaseUrl,
+    onPoolError: (error) => logger.warn({ error: error.message }, "pg pool background error (recovering)"),
+  });
   const redis = new Redis(config.redisUrl, {
     maxRetriesPerRequest: 3,
     retryStrategy: (times) => Math.min(times * 200, 5000),
+    enableReadyCheck: true,
+    // A dropped redis connection must NEVER crash the process via an
+    // unhandled 'error' event (that was the "restarts by itself" symptom:
+    // uncaughtException -> exit(1) -> docker restart -> brief auth outage).
+    // Reconnects happen in the background; commands fail fast meanwhile.
   });
+  redis.on("error", (error) => {
+    logger.warn({ error: error.message }, "redis connection error (reconnecting in background)");
+  });
+
+  await waitForPostgres(db, logger);
+  await waitForRedis(redis, logger);
+
   const libsqlDir = join(config.dataDir, "libsql");
   await mkdir(libsqlDir, { recursive: true });
+  await verifyDataDirWritable(config.dataDir);
+  logger.info({ data_dir: config.dataDir }, "preflight: data dir writable");
   const libsql = createClient({ url: `file:${libsqlDir}/platform.db` });
 
   const secretCrypto = new SecretCrypto(config.secretsMasterKey);
@@ -191,14 +331,23 @@ async function main() {
   cronScheduler.start();
 
   // --- Health ------------------------------------------------------------------
-  const health = new HealthService();
+  // /health проверяет ВСЕ системы: postgres, redis и data dir.
+  // Отвечает 200 только когда всё здорово, иначе 503 (см. packages/api app.ts).
+  const health = new HealthService({
+    startedAt,
+    checkTimeoutMs: Number(process.env.HEALTH_CHECK_TIMEOUT_MS ?? 5000),
+  });
   health.register("postgres", async () => {
     await db.execute("SELECT 1");
     return { ok: true };
   });
   health.register("redis", async () => {
     const pong = await redis.ping();
-    return { ok: pong === "PONG" };
+    return pong === "PONG" ? { ok: true } : { ok: false, detail: `unexpected reply: ${pong}` };
+  });
+  health.register("datadir", async () => {
+    await access(config.dataDir, fsConstants.W_OK);
+    return { ok: true };
   });
 
   // --- App ----------------------------------------------------------------------

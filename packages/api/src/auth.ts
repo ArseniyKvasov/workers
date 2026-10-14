@@ -33,7 +33,13 @@ export function extractBearerToken(header: string | undefined): string | null {
 export class AuthService {
   constructor(private readonly apiKeys: ApiKeysRepository) {}
 
-  /** Validate a bearer token; returns the auth context or null. */
+  /** Validate a bearer token; returns the auth context or null.
+   *
+   *  Read errors (DB unreachable) propagate to the caller so the HTTP layer
+   *  can answer 503 SERVICE_UNAVAILABLE instead of 401 — a key must never be
+   *  reported "invalid" just because postgres is briefly unreachable.
+   *  The `last_used_at` touch is best-effort: its failure never fails auth.
+   */
   async authenticate(token: string | null): Promise<AuthContext | null> {
     if (!token || !token.startsWith("wpk_")) return null;
 
@@ -56,7 +62,11 @@ export class AuthService {
 
     if (!matches) return null;
 
-    await this.apiKeys.touch(record.id);
+    try {
+      await this.apiKeys.touch(record.id);
+    } catch {
+      // best-effort usage accounting — auth itself already succeeded
+    }
     return { keyId: record.id, keyName: record.name };
   }
 }

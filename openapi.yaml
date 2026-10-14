@@ -1032,7 +1032,18 @@ paths:
   /health:
     get:
       tags: [observability]
-      summary: Liveness probe
+      summary: Deep health check of ALL systems (postgres, redis, datadir)
+      description: |
+        Returns 200 only when every dependency is healthy, otherwise 503.
+        Body: { status, version, node, uptimeSeconds, timestamp, checks: { <name>: { ok, latencyMs, detail? } } }.
+        Used by the docker healthcheck, deploy/production.sh and monitoring.
+      responses:
+        '200': { description: All systems healthy }
+        '503': { description: One or more dependencies unhealthy }
+  /live:
+    get:
+      tags: [observability]
+      summary: Liveness probe (process is up)
       responses:
         '200': { description: OK }
   /ready:

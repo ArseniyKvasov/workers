@@ -237,11 +237,34 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
   app.all("/w/:id/*", forwardToWorker);
 
   // --- Public endpoints (no auth) -------------------------------------------
-  app.get("/health", (c) => {
+  // /live — liveness: процесс запущен и отвечает. Всегда 200 пока жив.
+  app.get("/live", (c) => {
     if (deps.health.live()) return c.json({ status: "ok" });
     return c.json({ status: "unhealthy" }, 503);
   });
 
+  // /health — глубокая проверка ВСЕХ систем (postgres, redis, ...).
+  // Используется docker healthcheck, deploy-скриптом и мониторингом.
+  // Отвечает 200 только когда все зависимости здоровы, иначе 503.
+  const healthPayload = async () => {
+    const report = await deps.health.detailed();
+    return {
+      status: report.healthy ? "ok" : "unhealthy",
+      version: process.env.npm_package_version ?? "0.1.0",
+      node: process.version,
+      uptimeSeconds: report.uptimeSeconds,
+      timestamp: report.timestamp,
+      checks: report.checks,
+    };
+  };
+
+  app.get("/health", async (c) => {
+    const payload = await healthPayload();
+    return c.json(payload, payload.status === "ok" ? 200 : 503);
+  });
+
+  // /ready — readiness для blue/green деплоя и k8s: тот же глубокий отчет,
+  // но в формате { healthy, checks } для обратной совместимости.
   app.get("/ready", async (c) => {
     const report = await deps.health.ready();
     return c.json(report, report.healthy ? 200 : 503);
@@ -278,7 +301,22 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
       if (deps.config.apiKey && token === deps.config.apiKey) {
         authContext = { keyId: "env:API_KEY", keyName: "env-api-key" };
       } else {
-        authContext = await auth.authenticate(token);
+        try {
+          authContext = await auth.authenticate(token);
+        } catch (error) {
+          // БД каталога недоступна (pool exhausted, connection reset, ...).
+          // Это НЕ 401: ключ невозможно проверить — отдаём 503, чтобы клиенты
+          // и балансировщик ретраили, а не считали ключ невалидным.
+          deps.logger.warn(
+            { request_id: c.get("requestId"), error: String(error) },
+            "auth backend unavailable (postgres); returning 503"
+          );
+          c.header("Retry-After", "5");
+          return c.json(
+            { error: { code: "SERVICE_UNAVAILABLE", message: "auth backend temporarily unavailable" } },
+            503
+          );
+        }
       }
 
       if (!authContext) {

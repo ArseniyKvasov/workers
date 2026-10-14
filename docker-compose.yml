@@ -1,5 +1,54 @@
 # Production docker-compose: Postgres, Redis, Workers Platform App
 # Usage: docker compose up -d
+#
+# Auth wiring (why passwords stopped breaking deploys):
+#   - Postgres/Redis passwords live in POSTGRES_PASSWORD / REDIS_PASSWORD.
+#   - The app image entrypoint (deploy/docker-entrypoint.sh) rebuilds
+#     DATABASE_URL / REDIS_URL from the discrete POSTGRES_*/REDIS_* parts with
+#     proper percent-encoding, so ANY password works (even with @ / : ? # %).
+#   - The raw DATABASE_URL / REDIS_URL lines below are fallback defaults for
+#     `docker compose config` readability; the entrypoint rebuild wins whenever
+#     POSTGRES_HOST / REDIS_HOST are set (they always are here).
+
+x-app-env: &app-env
+  NODE_ENV: production
+  PORT: 3000
+  DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-workers_platform}
+  POSTGRES_USER: ${POSTGRES_USER:-postgres}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  POSTGRES_DB: ${POSTGRES_DB:-workers_platform}
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+  REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+  REDIS_PASSWORD: ${REDIS_PASSWORD}
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  SECRETS_MASTER_KEY: ${SECRETS_MASTER_KEY}
+  API_KEY: ${API_KEY}
+  DOMAIN: ${DOMAIN}
+  BLUE_PORT: ${BLUE_PORT:-3100}
+  GREEN_PORT: ${GREEN_PORT:-3200}
+  DATA_DIR: /data
+  EGRESS_ALLOWED_DOMAINS: ${EGRESS_ALLOWED_DOMAINS}
+  INGRESS_RATE_LIMIT_PER_MINUTE: ${INGRESS_RATE_LIMIT_PER_MINUTE:-300}
+  INGRESS_RATE_LIMIT_BURST: ${INGRESS_RATE_LIMIT_BURST:-50}
+  API_RATE_LIMIT_PER_MINUTE: ${API_RATE_LIMIT_PER_MINUTE:-600}
+  API_RATE_LIMIT_BURST: ${API_RATE_LIMIT_BURST:-100}
+  MAX_BODY_BYTES: ${MAX_BODY_BYTES:-10485760}
+  TRUSTED_PROXIES: ${TRUSTED_PROXIES}
+  CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS}
+  METRICS_TOKEN: ${METRICS_TOKEN}
+  EGRESS_TIMEOUT_MS: ${EGRESS_TIMEOUT_MS:-120000}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  RUNTIME_LOG_LEVEL: ${RUNTIME_LOG_LEVEL:-warn}
+  SERVICE_NAME: workers-platform
+  HEALTH_CHECK_TIMEOUT_MS: 5000
+
+x-app-logging: &app-logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
 
 services:
   postgres:
@@ -15,12 +64,16 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      # $$ escapes to $ so the check uses the container's runtime env.
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 20s
     networks:
       - workers-network
+    restart: unless-stopped
+    stop_grace_period: 30s
 
   redis:
     image: redis:7-alpine
@@ -34,40 +87,24 @@ services:
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a $${REDIS_PASSWORD} ping | grep PONG"]
+      # --no-auth-warning keeps the password out of the health output.
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 20s
     networks:
       - workers-network
+    restart: unless-stopped
+    stop_grace_period: 30s
 
   app:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: workers-app
-    environment:
-      - NODE_ENV=production
-      - PORT=3000
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-workers_platform}
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
-      - SECRETS_MASTER_KEY=${SECRETS_MASTER_KEY}
-      - API_KEY=${API_KEY}
-      - DOMAIN=${DOMAIN}
-      - BLUE_PORT=3100
-      - GREEN_PORT=3200
-      - DATA_DIR=/data
-      - EGRESS_ALLOWED_DOMAINS=${EGRESS_ALLOWED_DOMAINS}
-      - INGRESS_RATE_LIMIT_PER_MINUTE=${INGRESS_RATE_LIMIT_PER_MINUTE:-300}
-      - INGRESS_RATE_LIMIT_BURST=${INGRESS_RATE_LIMIT_BURST:-50}
-      - MAX_BODY_BYTES=${MAX_BODY_BYTES:-10485760}
-      - TRUSTED_PROXIES=${TRUSTED_PROXIES}
-      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS}
-      - METRICS_TOKEN=${METRICS_TOKEN}
-      - EGRESS_TIMEOUT_MS=${EGRESS_TIMEOUT_MS:-120000}
-      - LOG_LEVEL=${LOG_LEVEL:-info}
-      - RUNTIME_LOG_LEVEL=${RUNTIME_LOG_LEVEL:-warn}
-      - SERVICE_NAME=workers-platform
+    environment: *app-env
+    logging: *app-logging
     ports:
       - "${APP_HOST_PORT:-3000}:3000"
     volumes:
@@ -78,14 +115,19 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
+      # /health is a DEEP check (postgres + redis + datadir): 200 only when
+      # every system is up. Unhealthy != restarted (compose never restarts on
+      # unhealthy by default) — it just stops receiving deploy traffic.
       test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 90s
     networks:
       - workers-network
     restart: unless-stopped
+    # The app drains in-flight requests up to 35s on SIGTERM — give it room.
+    stop_grace_period: 40s
 
   # Blue/Green deployment slots (managed by deploy/production.sh).
   # Internal app port is always 3000; each slot publishes its host port
@@ -96,30 +138,8 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: workers-app-blue
-    environment:
-      - NODE_ENV=production
-      - PORT=3000
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-workers_platform}
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
-      - SECRETS_MASTER_KEY=${SECRETS_MASTER_KEY}
-      - API_KEY=${API_KEY}
-      - DOMAIN=${DOMAIN}
-      - BLUE_PORT=${BLUE_PORT:-3100}
-      - GREEN_PORT=${GREEN_PORT:-3200}
-      - DATA_DIR=/data
-      - EGRESS_ALLOWED_DOMAINS=${EGRESS_ALLOWED_DOMAINS}
-      - INGRESS_RATE_LIMIT_PER_MINUTE=${INGRESS_RATE_LIMIT_PER_MINUTE:-300}
-      - INGRESS_RATE_LIMIT_BURST=${INGRESS_RATE_LIMIT_BURST:-50}
-      - MAX_BODY_BYTES=${MAX_BODY_BYTES:-10485760}
-      - TRUSTED_PROXIES=${TRUSTED_PROXIES}
-      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS}
-      - METRICS_TOKEN=${METRICS_TOKEN}
-      - EGRESS_TIMEOUT_MS=${EGRESS_TIMEOUT_MS:-120000}
-      - API_RATE_LIMIT_PER_MINUTE=${API_RATE_LIMIT_PER_MINUTE:-600}
-      - API_RATE_LIMIT_BURST=${API_RATE_LIMIT_BURST:-100}
-      - LOG_LEVEL=${LOG_LEVEL:-info}
-      - RUNTIME_LOG_LEVEL=${RUNTIME_LOG_LEVEL:-warn}
-      - SERVICE_NAME=workers-platform
+    environment: *app-env
+    logging: *app-logging
     ports:
       - "127.0.0.1:${BLUE_PORT:-3100}:3000"
     volumes:
@@ -138,6 +158,7 @@ services:
     networks:
       - workers-network
     restart: unless-stopped
+    stop_grace_period: 40s
 
   app-green:
     profiles: ["blue-green"]
@@ -145,30 +166,8 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: workers-app-green
-    environment:
-      - NODE_ENV=production
-      - PORT=3000
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-workers_platform}
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
-      - SECRETS_MASTER_KEY=${SECRETS_MASTER_KEY}
-      - API_KEY=${API_KEY}
-      - DOMAIN=${DOMAIN}
-      - BLUE_PORT=${BLUE_PORT:-3100}
-      - GREEN_PORT=${GREEN_PORT:-3200}
-      - DATA_DIR=/data
-      - EGRESS_ALLOWED_DOMAINS=${EGRESS_ALLOWED_DOMAINS}
-      - INGRESS_RATE_LIMIT_PER_MINUTE=${INGRESS_RATE_LIMIT_PER_MINUTE:-300}
-      - INGRESS_RATE_LIMIT_BURST=${INGRESS_RATE_LIMIT_BURST:-50}
-      - MAX_BODY_BYTES=${MAX_BODY_BYTES:-10485760}
-      - TRUSTED_PROXIES=${TRUSTED_PROXIES}
-      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS}
-      - METRICS_TOKEN=${METRICS_TOKEN}
-      - EGRESS_TIMEOUT_MS=${EGRESS_TIMEOUT_MS:-120000}
-      - API_RATE_LIMIT_PER_MINUTE=${API_RATE_LIMIT_PER_MINUTE:-600}
-      - API_RATE_LIMIT_BURST=${API_RATE_LIMIT_BURST:-100}
-      - LOG_LEVEL=${LOG_LEVEL:-info}
-      - RUNTIME_LOG_LEVEL=${RUNTIME_LOG_LEVEL:-warn}
-      - SERVICE_NAME=workers-platform
+    environment: *app-env
+    logging: *app-logging
     ports:
       - "127.0.0.1:${GREEN_PORT:-3200}:3000"
     volumes:
@@ -187,6 +186,7 @@ services:
     networks:
       - workers-network
     restart: unless-stopped
+    stop_grace_period: 40s
 
 volumes:
   postgres-data:

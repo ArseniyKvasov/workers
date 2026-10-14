@@ -117,6 +117,35 @@ require_env() {
 blue_port()  { echo "${BLUE_PORT:-3100}"; }
 green_port() { echo "${GREEN_PORT:-3200}"; }
 
+# Percent-encode a string for use in a URL userinfo part (passwords with
+# @ / : ? # % break raw interpolation into DATABASE_URL / REDIS_URL).
+urlencode() {
+  if command -v node >/dev/null 2>&1; then
+    node -e 'process.stdout.write(encodeURIComponent(process.argv[1] ?? ""))' "$1"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import sys,urllib.parse; sys.stdout.write(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# DATABASE_URL with the password safely encoded (never interpolate raw).
+encoded_database_url() {
+  local pass_enc
+  pass_enc="$(urlencode "${POSTGRES_PASSWORD:-}")"
+  printf 'postgresql://%s:%s@postgres:5432/%s' \
+    "${POSTGRES_USER:-postgres}" "$pass_enc" "${POSTGRES_DB:-workers_platform}"
+}
+
+# REDIS_URL with the password safely encoded. NOTE: blue/green slots used to
+# start with `redis://redis:6379` (NO password) while redis requires one —
+# every slot failed redis auth and /ready never passed. Never drop this again.
+encoded_redis_url() {
+  local pass_enc
+  pass_enc="$(urlencode "${REDIS_PASSWORD:-}")"
+  printf 'redis://:%s@redis:6379' "$pass_enc"
+}
+
 container_for_slot() { case "$1" in blue) echo "$BLUE_CONTAINER" ;; green) echo "$GREEN_CONTAINER" ;; *) die "unknown slot: $1" ;; esac; }
 port_for_slot()      { case "$1" in blue) blue_port ;; green) green_port ;; *) die "unknown slot: $1" ;; esac; }
 other_slot()         { case "$1" in blue) echo green ;; green) echo blue ;; *) die "unknown slot: $1" ;; esac; }
@@ -195,11 +224,31 @@ preflight() {
     || { err "preflight FAIL: Dockerfile missing"; failures=$((failures + 1)); }
 
   local missing=()
-  for v in DOMAIN SECRETS_MASTER_KEY API_KEY POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB; do
+  for v in DOMAIN SECRETS_MASTER_KEY API_KEY POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB REDIS_PASSWORD; do
     [[ -n "${!v:-}" ]] || missing+=("$v")
   done
   if [[ "${#missing[@]}" -eq 0 ]]; then log "preflight ok: required env vars set"
   else err "preflight FAIL: missing env vars: ${missing[*]}"; failures=$((failures + 1)); fi
+
+  # SECRETS_MASTER_KEY must decode to exactly 32 bytes (AES-256); the app
+  # refuses to boot otherwise, so catch it here before touching anything.
+  if command -v node >/dev/null 2>&1; then
+    if SMK="${SECRETS_MASTER_KEY:-}" node -e 'const b=Buffer.from(process.env.SMK||"","base64"); process.exit(b.length===32?0:1)'; then
+      log "preflight ok: SECRETS_MASTER_KEY decodes to 32 bytes"
+    else
+      err "preflight FAIL: SECRETS_MASTER_KEY must be 32 bytes base64 (openssl rand -base64 32)"
+      failures=$((failures + 1))
+    fi
+  elif command -v python3 >/dev/null 2>&1; then
+    if SMK="${SECRETS_MASTER_KEY:-}" python3 -c 'import base64,os,sys; sys.exit(0 if len(base64.b64decode(os.environ.get("SMK",""))) == 32 else 1)'; then
+      log "preflight ok: SECRETS_MASTER_KEY decodes to 32 bytes"
+    else
+      err "preflight FAIL: SECRETS_MASTER_KEY must be 32 bytes base64 (openssl rand -base64 32)"
+      failures=$((failures + 1))
+    fi
+  else
+    warn "preflight: neither node nor python3 found — skipping SECRETS_MASTER_KEY length check"
+  fi
 
   # BOOTSTRAP_OPEN_API disables auth on POST /api/api-keys; refuse to deploy
   # it enabled unless explicitly overridden (one-shot bootstrap recovery).
@@ -226,6 +275,43 @@ preflight() {
   docker network inspect "$NETWORK" >/dev/null 2>&1 \
     && log "preflight ok: network $NETWORK exists" \
     || { err "preflight FAIL: network $NETWORK missing (override with DOCKER_NETWORK=<name>)"; failures=$((failures + 1)); }
+
+  # Live auth checks: can we ACTUALLY log into postgres and redis with the
+  # configured credentials? This catches wrong/rotated passwords and the
+  # classic "DATABASE_URL with an unencoded special char" BEFORE the deploy.
+  if container_running workers-postgres; then
+    if docker run --rm --network "$NETWORK" \
+        -e PGPASSWORD="${POSTGRES_PASSWORD:-}" \
+        postgres:16-alpine \
+        psql -h postgres -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-workers_platform}" \
+        -tAc "SELECT 1" 2>/dev/null | grep -q 1; then
+      log "preflight ok: postgres auth works (SELECT 1)"
+    else
+      err "preflight FAIL: cannot authenticate to postgres as '${POSTGRES_USER:-postgres}' on db '${POSTGRES_DB:-workers_platform}'"
+      err "  check POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB in $ENV_FILE"
+      failures=$((failures + 1))
+    fi
+  fi
+  if container_running workers-redis; then
+    if docker exec workers-redis redis-cli -a "${REDIS_PASSWORD:-}" --no-auth-warning ping 2>/dev/null | grep -q PONG; then
+      log "preflight ok: redis auth works (PING -> PONG)"
+    else
+      err "preflight FAIL: cannot authenticate to redis (wrong REDIS_PASSWORD?)"
+      failures=$((failures + 1))
+    fi
+  fi
+
+  # Slot host ports must be free (or belong to our own previous slot).
+  for slot in blue green; do
+    local p
+    p="$(port_for_slot "$slot")"
+    if (command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":${p} ") \
+      || (command -v lsof >/dev/null 2>&1 && lsof -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1); then
+      warn "preflight: host port $p (slot $slot) is already listening — deploy will replace the container, ensure it is ours"
+    else
+      log "preflight ok: host port $p (slot $slot) free"
+    fi
+  done
 
   # S3 backup prerequisites (unless explicitly skipped).
   if [[ "${SKIP_BACKUP:-0}" == "1" ]]; then
@@ -558,7 +644,7 @@ run_migrations() {
   ensure_database
   log "migrations: applying from image ${image} (backup already taken)"
   if docker run --rm --network "$NETWORK" \
-      -e DATABASE_URL="postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-workers_platform}" \
+      -e DATABASE_URL="$(encoded_database_url)" \
       "$image" node packages/catalog/dist/migrate-cli.js >&2; then
     log "migrations: up to date"
   else
@@ -574,14 +660,26 @@ start_slot() {
   docker rm -f "$container" >/dev/null 2>&1 || true
   log "starting ${container} (image ${image}, 127.0.0.1:${port} -> ${INTERNAL_PORT})"
 
+  # Env must mirror docker-compose app service. In particular REDIS_URL MUST
+  # carry the password (redis runs with --requirepass) and both URLs MUST use
+  # percent-encoded passwords (see encoded_*_url). Discrete POSTGRES_*/REDIS_*
+  # parts are passed too so the image entrypoint can rebuild the URLs itself.
   docker run -d --name "$container" \
     --network "$NETWORK" \
     --restart unless-stopped \
     -p "127.0.0.1:${port}:${INTERNAL_PORT}" \
     -e PORT="$INTERNAL_PORT" \
     -e NODE_ENV=production \
-    -e DATABASE_URL="postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-workers_platform}" \
-    -e REDIS_URL=redis://redis:6379 \
+    -e DATABASE_URL="$(encoded_database_url)" \
+    -e POSTGRES_USER="${POSTGRES_USER:-postgres}" \
+    -e POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}" \
+    -e POSTGRES_DB="${POSTGRES_DB:-workers_platform}" \
+    -e POSTGRES_HOST=postgres \
+    -e POSTGRES_PORT=5432 \
+    -e REDIS_URL="$(encoded_redis_url)" \
+    -e REDIS_PASSWORD="${REDIS_PASSWORD:-}" \
+    -e REDIS_HOST=redis \
+    -e REDIS_PORT=6379 \
     -e SECRETS_MASTER_KEY="${SECRETS_MASTER_KEY}" \
     -e API_KEY="${API_KEY}" \
     -e DOMAIN="${DOMAIN}" \
@@ -589,11 +687,19 @@ start_slot() {
     -e GREEN_PORT="$(green_port)" \
     -e DATA_DIR=/data \
     -e EGRESS_ALLOWED_DOMAINS="${EGRESS_ALLOWED_DOMAINS:-}" \
+    -e INGRESS_RATE_LIMIT_PER_MINUTE="${INGRESS_RATE_LIMIT_PER_MINUTE:-300}" \
+    -e INGRESS_RATE_LIMIT_BURST="${INGRESS_RATE_LIMIT_BURST:-50}" \
     -e API_RATE_LIMIT_PER_MINUTE="${API_RATE_LIMIT_PER_MINUTE:-600}" \
     -e API_RATE_LIMIT_BURST="${API_RATE_LIMIT_BURST:-100}" \
+    -e MAX_BODY_BYTES="${MAX_BODY_BYTES:-10485760}" \
+    -e TRUSTED_PROXIES="${TRUSTED_PROXIES:-}" \
+    -e CORS_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS:-}" \
+    -e METRICS_TOKEN="${METRICS_TOKEN:-}" \
+    -e EGRESS_TIMEOUT_MS="${EGRESS_TIMEOUT_MS:-120000}" \
     -e LOG_LEVEL="${LOG_LEVEL:-info}" \
     -e RUNTIME_LOG_LEVEL="${RUNTIME_LOG_LEVEL:-warn}" \
     -e SERVICE_NAME=workers-platform \
+    -e HEALTH_CHECK_TIMEOUT_MS="${HEALTH_CHECK_TIMEOUT_MS:-5000}" \
     -v workers-data:/data \
     --memory "${CONTAINER_MEMORY:-2g}" \
     --cpus "${CONTAINER_CPUS:-2}" \

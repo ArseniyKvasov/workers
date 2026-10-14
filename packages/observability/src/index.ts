@@ -7,5 +7,7 @@ export {
   HealthService,
   registerHealthRoutes,
   type HealthCheck,
+  type HealthCheckResult,
   type HealthReport,
+  type HealthServiceOptions,
 } from "./health.js";
