@@ -28,22 +28,10 @@ export interface WorkersServiceDeps {
   isolates: IsolateManager;
   secretCrypto: SecretCrypto;
   dataDir: string;
+  /** Egress allowlist; ["*"] allows all public domains. */
+  egressAllowedDomains: string[];
   /** Log binding for writing request logs */
   logs: LogBinding;
-}
-
-export interface WorkersServiceDeps {
-  workers: WorkersRepository;
-  versions: VersionsRepository;
-  bindingsRepo: BindingsRepository;
-  secretsRepo: SecretsRepository;
-  d1Catalog: D1CatalogRepository;
-  kvCatalog: KVCatalogRepository;
-  queuesCatalog: QueuesCatalogRepository;
-  usage: UsageRepository;
-  isolates: IsolateManager;
-  secretCrypto: SecretCrypto;
-  dataDir: string;
 }
 
 export class WorkersService {
@@ -180,7 +168,7 @@ export class WorkersService {
         memory_mb: (worker.limits.memory_mb as number) ?? DEFAULT_LIMITS.memory_mb,
         concurrency: (worker.limits.concurrency as number) ?? DEFAULT_LIMITS.concurrency,
       },
-      egress: { allowedDomains: [] },
+      egress: { allowedDomains: this.deps.egressAllowedDomains },
     });
 
     return { version, promoted };
@@ -261,7 +249,7 @@ export class WorkersService {
         memory_mb: (worker.limits.memory_mb as number) ?? DEFAULT_LIMITS.memory_mb,
         concurrency: (worker.limits.concurrency as number) ?? DEFAULT_LIMITS.concurrency,
       },
-      egress: { allowedDomains: [] },
+      egress: { allowedDomains: this.deps.egressAllowedDomains },
     });
   }
 

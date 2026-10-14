@@ -123,6 +123,7 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
     isolates: deps.isolates,
     secretCrypto: deps.secretCrypto,
     dataDir: deps.config.dataDir,
+    egressAllowedDomains: deps.config.egressAllowedDomains,
     logs: new LogBinding("system", deps.redis, { maxLen: 100_000 }),
   });
 
@@ -187,7 +188,7 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
 
   const forwardToWorker = async (c: Context<AppVariables>) => {
     const workerId = c.req.param("id");
-    const subpath = c.req.param("0") ?? "";
+    const subpath = c.req.param("*") ?? "";
     if (!workerId || !UUID_RE.test(workerId)) {
       return c.json({ error: { code: "NOT_FOUND", message: "worker id is required" } }, 404);
     }

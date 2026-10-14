@@ -54,10 +54,17 @@ function loadConfig(): AppConfig {
     port: Number(process.env.PORT ?? 3000),
     rateLimitPerMinute: Number(process.env.API_RATE_LIMIT_PER_MINUTE ?? 600),
     rateLimitBurst: Number(process.env.API_RATE_LIMIT_BURST ?? 100),
-    egressAllowedDomains: (process.env.EGRESS_ALLOWED_DOMAINS ?? "")
+    // Empty means unrestricted access to public domains. Private/internal
+    // destinations remain blocked by the runtime's SSRF protection.
+    egressAllowedDomains: (process.env.EGRESS_ALLOWED_DOMAINS ?? "*")
       .split(",")
       .map((d) => d.trim())
-      .filter((d) => d.length > 0),
+      .filter((d) => d.length > 0).length > 0
+      ? (process.env.EGRESS_ALLOWED_DOMAINS ?? "*")
+          .split(",")
+          .map((d) => d.trim())
+          .filter((d) => d.length > 0)
+      : ["*"],
     apiKey: process.env.API_KEY || undefined,
     maxBodyBytes: intEnv("MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
     /** Rate limiting for public worker ingress (per IP+worker). */
@@ -319,6 +326,7 @@ async function main() {
       isolates,
       secretCrypto,
       dataDir: config.dataDir,
+      egressAllowedDomains: config.egressAllowedDomains,
       logs,
     }),
     logger,
