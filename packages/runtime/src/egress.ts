@@ -16,6 +16,8 @@ export interface EgressConfig {
   blockPrivateIps?: boolean;
   /** Abort outbound fetches after this long (default 30s). */
   timeoutMs?: number;
+  /** Maximum outbound request body size (default 10 MB). */
+  maxRequestBytes?: number;
 }
 
 export class EgressBlockedError extends Error {
@@ -64,10 +66,11 @@ export function createOutboundService(
 ): (request: Request) => Promise<Response> {
   const blockPrivate = config.blockPrivateIps ?? true;
   const timeoutMs = config.timeoutMs ?? 30_000;
+  const maxRequestBytes = config.maxRequestBytes ?? 10 * 1024 * 1024;
 
   return async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
-    const hostname = url.hostname.replace(/^\[|\]$/g, "");
+    const hostname = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
 
     if (!matchesAllowlist(hostname, config.allowedDomains)) {
       throw new EgressBlockedError(`egress blocked: "${hostname}" is not in the allowlist`);
@@ -94,8 +97,15 @@ export function createOutboundService(
       }
     }
 
-    // Meter request body bytes
+    // Meter and cap request body bytes before forwarding upstream.
+    const declaredBodyLength = Number(request.headers.get("content-length") ?? "NaN");
+    if (Number.isFinite(declaredBodyLength) && declaredBodyLength > maxRequestBytes) {
+      throw new EgressBlockedError(`egress blocked: request body exceeds ${maxRequestBytes} bytes`);
+    }
     const body = request.body ? await request.clone().arrayBuffer() : null;
+    if (body && body.byteLength > maxRequestBytes) {
+      throw new EgressBlockedError(`egress blocked: request body exceeds ${maxRequestBytes} bytes`);
+    }
     hooks.onEgressBytes?.(workerId, body?.byteLength ?? 0);
 
     // Never let a hung upstream pin a worker isolate indefinitely.
@@ -103,6 +113,7 @@ export function createOutboundService(
       method: request.method,
       headers: request.headers,
       body: body as ArrayBuffer | null,
+      redirect: "manual",
       signal: AbortSignal.timeout(timeoutMs),
     });
   };

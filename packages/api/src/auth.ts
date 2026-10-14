@@ -72,9 +72,10 @@ export class AuthService {
 }
 
 function timingSafeEqualStr(a: string, b: string): boolean {
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  let diff = a.length ^ b.length;
+  const length = Math.max(a.length, b.length);
+  for (let i = 0; i < length; i++) {
+    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
   }
   return diff === 0;
 }

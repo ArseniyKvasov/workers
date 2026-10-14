@@ -47,7 +47,9 @@ export interface AppConfig {
   rateLimitPerMinute: number;
   rateLimitBurst: number;
   egressAllowedDomains: string[];
-  /** Static management API key from env; also accepts DB-stored keys. */
+  egressTimeoutMs: number;
+  maxResponseBytes: number;
+  /** Static management API key from env; also accepts DB-stored API keys. */
   apiKey?: string;
   /** Cap for request bodies (413 above); default 10 MB. */
   maxBodyBytes: number;
@@ -124,6 +126,9 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
     secretCrypto: deps.secretCrypto,
     dataDir: deps.config.dataDir,
     egressAllowedDomains: deps.config.egressAllowedDomains,
+    egressTimeoutMs: deps.config.egressTimeoutMs,
+    maxResponseBytes: deps.config.maxResponseBytes,
+    redis: deps.redis,
     logs: new LogBinding("system", deps.redis, { maxLen: 100_000 }),
   });
 
@@ -144,10 +149,8 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
     app.use(honoLogger());
   }
 
-  if (process.env.BOOTSTRAP_OPEN_API === "1" && process.env.NODE_ENV === "production") {
-    deps.logger.warn(
-      "BOOTSTRAP_OPEN_API=1 in production: POST /api/api-keys is UNAUTHENTICATED. Finish bootstrapping and unset it immediately."
-    );
+  if (process.env.BOOTSTRAP_OPEN_API === "1" && process.env.NODE_ENV !== "production") {
+    deps.logger.warn("BOOTSTRAP_OPEN_API enabled in non-production: POST /api/api-keys is unauthenticated");
   }
 
   // Request ID + logging + metrics + auth + rate limiting
@@ -195,14 +198,9 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
 
     const query: Record<string, string> = {};
     try {
-      c.req.raw.url
-        .split("?")[1]
-        ?.split("&")
-        .filter((pair) => pair.length > 0)
-        .forEach((pair) => {
-          const [key, ...rest] = pair.split("=");
-          query[decodeURIComponent(key!)] = decodeURIComponent(rest.join("="));
-        });
+      new URL(c.req.raw.url).searchParams.forEach((value, key) => {
+        query[key] = value;
+      });
     } catch {
       return c.json(
         { error: { code: "VALIDATION_ERROR", message: "malformed query string" } },
@@ -231,7 +229,8 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
     for (const [key, value] of Object.entries(result.headers)) {
       if (key !== "transfer-encoding" && key !== "content-length") c.header(key, value);
     }
-    return c.body(result.body.buffer as ArrayBuffer, result.status as 200);
+    const responseBody = new Uint8Array(result.body);
+    return c.body(responseBody, result.status as 200);
   };
 
   app.all("/w/:id", forwardToWorker);
@@ -261,24 +260,27 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
 
   app.get("/health", async (c) => {
     const payload = await healthPayload();
-    return c.json(payload, payload.status === "ok" ? 200 : 503);
+    const checks = Object.fromEntries(Object.entries(payload.checks).map(([name, check]) => [name, { ok: check.ok, latencyMs: check.latencyMs }]));
+    return c.json({ ...payload, checks }, payload.status === "ok" ? 200 : 503);
   });
 
   // /ready — readiness для blue/green деплоя и k8s: тот же глубокий отчет,
   // но в формате { healthy, checks } для обратной совместимости.
   app.get("/ready", async (c) => {
     const report = await deps.health.ready();
-    return c.json(report, report.healthy ? 200 : 503);
+    const checks = Object.fromEntries(Object.entries(report.checks).map(([name, check]) => [name, { ok: check.ok, latencyMs: check.latencyMs }]));
+    return c.json({ ...report, checks }, report.healthy ? 200 : 503);
   });
 
   app.get("/metrics", async (c) => {
+    if (!deps.config.metricsToken && process.env.NODE_ENV === "production") {
+      return c.json({ error: { code: "SERVICE_UNAVAILABLE", message: "metrics endpoint is disabled without METRICS_TOKEN" } }, 503);
+    }
     if (deps.config.metricsToken) {
       const token = (c.req.header("authorization") ?? "").replace(/^Bearer\s+/i, "");
       if (!token || !timingSafeEqualStr(token, deps.config.metricsToken)) {
         return c.json({ error: { code: "UNAUTHORIZED", message: "metrics token required" } }, 401);
       }
-    } else if (process.env.NODE_ENV === "production") {
-      deps.logger.warn("GET /metrics without METRICS_TOKEN: metrics are publicly exposed");
     }
     c.header("content-type", "text/plain; version=0.0.4; charset=utf-8");
     return c.body(await deps.metrics.serve());
@@ -295,11 +297,15 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
     const bootstrapMode = process.env.BOOTSTRAP_OPEN_API === "1";
     const isApiKeyCreate = c.req.method === "POST" && c.req.path === "/api/api-keys";
 
+    if (bootstrapMode && process.env.NODE_ENV === "production") {
+      return c.json({ error: { code: "SERVICE_UNAVAILABLE", message: "bootstrap mode is disabled in production" } }, 503);
+    }
+
     if (!(bootstrapMode && isApiKeyCreate)) {
       const token = (c.req.header("authorization") ?? "").replace(/^Bearer\s+/i, "") || null;
       let authContext: { keyId: string; keyName: string } | null = null;
 
-      if (deps.config.apiKey && token === deps.config.apiKey) {
+      if (deps.config.apiKey && token && timingSafeEqualStr(token, deps.config.apiKey)) {
         authContext = { keyId: "env:API_KEY", keyName: "env-api-key" };
       } else {
         try {
@@ -338,7 +344,10 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
     await next();
   });
 
-  app.use("/api/*", rateLimiter.middleware());
+  app.use("/api/*", rateLimiter.middleware((c) => {
+    const apiKeyId = c.get("apiKeyId") as string | undefined;
+    return apiKeyId ?? getClientIp(c, deps.config.trustedProxies);
+  }));
 
   // --- Audit wrapper for mutating requests ----------------------------------
   app.use("/api/*", async (c, next) => {
@@ -366,11 +375,11 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
   // --- API routes -------------------------------------------------------------
   const api = new Hono();
   const logs = new LogBinding("system", deps.redis, { maxLen: 100_000 });
-  api.route("/", workersRoutes({ workersService, maxBodyBytes: deps.config.maxBodyBytes, logs }));
+  api.route("/", workersRoutes({ workersService, maxBodyBytes: deps.config.maxBodyBytes, redis: deps.redis, logs }));
   api.route("/", d1Routes({ workersService, d1Catalog: deps.repositories.d1Catalog }));
   api.route("/", kvRoutes({ workersService, kvCatalog: deps.repositories.kvCatalog, redis: deps.redis }));
   api.route("/", queuesRoutes({ workersService, queuesCatalog: deps.repositories.queuesCatalog, redis: deps.redis }));
-  api.route("/", secretsRoutes({ secretsRepo: deps.repositories.secrets, secretCrypto: deps.secretCrypto }));
+  api.route("/", secretsRoutes({ workersService, secretsRepo: deps.repositories.secrets, secretCrypto: deps.secretCrypto }));
   api.route("/cron", cronRoutes({ workersService, cronJobs: deps.repositories.cronJobs }));
   api.route("/api-keys", apiKeyRoutes({ apiKeys: deps.repositories.apiKeys }));
   app.route("/api", api);

@@ -44,11 +44,19 @@ export interface InvokeResult {
   metrics: { cpuMs: number; wallMs: number };
 }
 
+export class ResponseTooLargeError extends Error {
+  constructor(public readonly maxBytes: number) {
+    super(`worker response exceeds ${maxBytes} bytes`);
+    this.name = "ResponseTooLargeError";
+  }
+}
+
 export interface IsolateRuntimeDeps {
   redis: Redis;
   libsql: LibSQLClient;
   d1FilePath: (workerId: string, name: string) => string;
   egressDefaults: EgressConfig;
+  maxResponseBytes: number;
   /** Extra hooks merged into every worker's binding services (usage metering). */
   bindingUsageHooks?: {
     onRowsRead?: (workerId: string, rows: number) => void;
@@ -62,7 +70,7 @@ interface WorkerIsolate {
   mf: Miniflare;
   versionId: string;
   concurrency: number;
-  services: { d1: ServiceHandler; kv: ServiceHandler; queue: ServiceHandler; logs: ServiceHandler; dispose: () => void };
+  services: { d1: ServiceHandler; kv: ServiceHandler; queue: ServiceHandler; logs: ServiceHandler; dispose: () => Promise<void> };
   inFlight: number;
   draining: boolean;
 }
@@ -111,9 +119,9 @@ export class IsolateManager {
 
   private async applyScript(isolate: WorkerIsolate, input: IsolateDeployInput): Promise<void> {
     const options = await this.buildOptions(input, isolate.services);
+    await isolate.mf.setOptions(options);
     isolate.versionId = input.versionId;
     isolate.concurrency = Math.max(MAX_CONCURRENCY_FLOOR, input.limits.concurrency);
-    await isolate.mf.setOptions(options);
   }
 
   private createServices(input: IsolateDeployInput) {
@@ -153,7 +161,10 @@ export class IsolateManager {
     const shimBundle = await bundleWithShim(userBundle.code, shimSource);
 
     const concurrency = Math.max(MAX_CONCURRENCY_FLOOR, input.limits.concurrency);
-    const outbound = createOutboundService(input.workerId, input.egress, {
+    const outbound = createOutboundService(input.workerId, {
+      ...this.deps.egressDefaults,
+      ...input.egress,
+    }, {
       onEgressBytes: (wid, bytes) => this.metrics.egressBytesTotal.inc({ worker_id: wid }, bytes),
     });
 
@@ -224,7 +235,13 @@ export class IsolateManager {
         },
         body: requestBody,
       } as unknown as Parameters<typeof isolate.mf.dispatchFetch>[1]);
-      const body = new Uint8Array(await response.arrayBuffer());
+
+      const declaredLength = Number(response.headers.get("content-length") ?? "NaN");
+      if (Number.isFinite(declaredLength) && declaredLength > this.deps.maxResponseBytes) {
+        await response.body?.cancel();
+        throw new ResponseTooLargeError(this.deps.maxResponseBytes);
+      }
+      const body = await this.readResponseBody(response);
 
       const headers: Record<string, string> = {};
       response.headers.forEach((value, key) => {
@@ -245,17 +262,47 @@ export class IsolateManager {
     } catch (error) {
       const isEgress = error instanceof Error && error.name === "EgressBlockedError";
       const isConcurrency = error instanceof Error && error.name === "ConcurrencyLimitError";
+      const isResponseTooLarge = error instanceof Error && error.name === "ResponseTooLargeError";
       this.metrics.requestsTotal.inc({
         worker_id: input.workerId,
-        status: isEgress ? "403" : isConcurrency ? "429" : "500",
+        status: isEgress ? "403" : isConcurrency ? "429" : isResponseTooLarge ? "502" : "500",
       });
-      if (!isEgress && !isConcurrency) {
+      if (!isEgress && !isConcurrency && !isResponseTooLarge) {
         this.metrics.errorsTotal.inc({ worker_id: input.workerId, type: "invoke" });
       }
       throw error;
     } finally {
       isolate.inFlight--;
     }
+  }
+
+  private async readResponseBody(response: unknown): Promise<Uint8Array> {
+    const bodyStream = (response as { body?: { getReader(): { read(): Promise<{ done: boolean; value?: Uint8Array; }>; cancel(): Promise<void>; releaseLock(): void; }; } | null }).body;
+    if (!bodyStream) return new Uint8Array(0);
+    const reader = bodyStream.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done || !value) break;
+        total += value.byteLength;
+        if (total > this.deps.maxResponseBytes) {
+          await reader.cancel();
+          throw new ResponseTooLargeError(this.deps.maxResponseBytes);
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const body = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return body;
   }
 
   private getConcurrency(_workerId: string): number {
@@ -275,7 +322,7 @@ export class IsolateManager {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
 
-    isolate.services.dispose();
+    await isolate.services.dispose();
     await isolate.mf.dispose();
     this.isolates.delete(workerId);
     this.metrics.isolatesActive.set(this.isolates.size);

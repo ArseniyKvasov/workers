@@ -118,8 +118,7 @@ export function d1Routes(deps: {
     const name = c.req.param("name");
     await deps.workersService.getWorker(workerId);
 
-    const deleted = await deps.d1Catalog.delete(workerId, name);
-    if (!deleted) throw notFound("D1 database", `${workerId}/${name}`);
+    await deps.workersService.deleteD1(workerId, name);
     return c.json({ data: { deleted: true } });
   });
 
@@ -193,8 +192,7 @@ export function kvRoutes(deps: {
     const namespace = c.req.param("namespace");
     await deps.workersService.getWorker(workerId);
 
-    const deleted = await deps.kvCatalog.delete(workerId, namespace);
-    if (!deleted) throw notFound("KV namespace", `${workerId}/${namespace}`);
+    await deps.workersService.deleteKv(workerId, namespace);
     return c.json({ data: { deleted: true } });
   });
 
@@ -268,8 +266,7 @@ export function queuesRoutes(deps: {
     const queueName = c.req.param("queue");
     await deps.workersService.getWorker(workerId);
 
-    const deleted = await deps.queuesCatalog.delete(workerId, queueName);
-    if (!deleted) throw notFound("queue", `${workerId}/${queueName}`);
+    await deps.workersService.deleteQueue(workerId, queueName);
     return c.json({ data: { deleted: true } });
   });
 

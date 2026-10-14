@@ -47,7 +47,7 @@ export function createBindingServices(workerId: string, options: BindingServiceO
   queue: ServiceHandler;
   logs: ServiceHandler;
   /** Drop cached binding instances for this worker (on reload). */
-  dispose: () => void;
+  dispose: () => Promise<void>;
 } {
   const hooks = options.hooks ?? {};
 
@@ -201,7 +201,7 @@ export function createBindingServices(workerId: string, options: BindingServiceO
             requestSize: (p.requestSize as number) ?? 0,
             responseSize: (p.responseSize as number) ?? 0,
             clientIp: (p.clientIp as string) ?? "worker",
-            workerId: (p.workerId as string) ?? "",
+            workerId,
             error: p.error as string | undefined,
             traceId: p.traceId as string | undefined,
           };
@@ -221,11 +221,18 @@ export function createBindingServices(workerId: string, options: BindingServiceO
     kv: kvHandler,
     queue: queueHandler,
     logs: logsHandler,
-    dispose: () => {
-      for (const key of [...d1Bindings.keys()]) if (key.startsWith(`${workerId}:`)) d1Bindings.delete(key);
+    dispose: async () => {
+      const closing: Promise<void>[] = [];
+      for (const [key, binding] of [...d1Bindings.entries()]) {
+        if (key.startsWith(`${workerId}:`)) {
+          closing.push(binding.close().catch(() => {}));
+          d1Bindings.delete(key);
+        }
+      }
       for (const key of [...kvBindings.keys()]) if (key.startsWith(`${workerId}:`)) kvBindings.delete(key);
       for (const key of [...queueBindings.keys()]) if (key.startsWith(`${workerId}:`)) queueBindings.delete(key);
       for (const key of [...logBindings.keys()]) if (key.startsWith(`${workerId}:`)) logBindings.delete(key);
+      await Promise.all(closing);
     },
   };
 }

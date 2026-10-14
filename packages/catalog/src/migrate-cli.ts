@@ -53,6 +53,18 @@ async function main() {
     await db.execute(
       sql`CREATE INDEX IF NOT EXISTS worker_versions_promoted_idx ON worker_versions (worker_id, promoted_at)`
     );
+    await db.execute(sql`
+      DELETE FROM worker_versions a
+      USING worker_versions b
+      WHERE a.worker_id = b.worker_id
+        AND a.promoted_at IS NOT NULL
+        AND b.promoted_at IS NOT NULL
+        AND (a.promoted_at < b.promoted_at OR (a.promoted_at = b.promoted_at AND a.id < b.id))
+    `);
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS worker_versions_one_promoted_uq
+      ON worker_versions (worker_id) WHERE promoted_at IS NOT NULL
+    `);
 
     await db.execute(sql`
       CREATE TABLE IF NOT EXISTS worker_bindings (

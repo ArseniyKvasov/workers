@@ -124,7 +124,7 @@ export class LogBinding {
     } = query;
 
     // Build XRANGE/XREVRANGE arguments
-    const start = cursor ?? "+"; // "+" = latest
+    const start = cursor ? `(${cursor}` : "+"; // exclusive cursor; "+" = latest
     const end = "-"; // "-" = earliest
 
     const results = await this.redis.xrevrange(
@@ -183,6 +183,19 @@ export class LogBinding {
     return removed ?? 0;
   }
 
+  /** Trim every worker log stream in Redis. */
+  async trimAllByTime(olderThan: Date): Promise<number> {
+    const minId = this.timestampToStreamId(olderThan);
+    let cursor = "0";
+    let removed = 0;
+    do {
+      const [next, keys] = (await this.redis.scan(cursor, "MATCH", "wp:*:logs", "COUNT", 200)) as [string, string[]];
+      cursor = next;
+      for (const key of keys) removed += (await this.redis.xtrim(key, "MINID", minId)) ?? 0;
+    } while (cursor !== "0");
+    return removed;
+  }
+
   /** Convert Date to Redis stream ID (ms-seq format) */
   private timestampToStreamId(date: Date): string {
     return `${date.getTime()}-0`;
@@ -208,8 +221,9 @@ export class LogBinding {
 
     // Error message truncation
     if (sanitized.error) {
-      sanitized.error = sanitized.error.slice(0, 500);
+      sanitized.error = LogBinding.redactString(sanitized.error).slice(0, 500);
     }
+    sanitized.path = LogBinding.redactString(sanitized.path).slice(0, 2000);
 
     return sanitized;
   }

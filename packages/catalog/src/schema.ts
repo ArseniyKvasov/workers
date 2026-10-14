@@ -43,6 +43,9 @@ export const workerVersions = pgTable(
   (t) => [
     index("worker_versions_worker_idx").on(t.workerId),
     index("worker_versions_promoted_idx").on(t.workerId, t.promotedAt),
+    uniqueIndex("worker_versions_one_promoted_uq")
+      .on(t.workerId)
+      .where(sql`${t.promotedAt} IS NOT NULL`),
   ],
 );
 

@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { rm } from "node:fs/promises";
+import type { Redis } from "ioredis";
 import type {
   WorkersRepository,
   VersionsRepository,
@@ -12,8 +14,8 @@ import type {
 } from "@platform/catalog";
 import type { IsolateManager } from "@platform/runtime";
 import type { SecretCrypto } from "@platform/bindings";
-import type { LogBinding, LogEntry } from "@platform/bindings";
-import { DEFAULT_LIMITS, PLATFORM_LIMITS, DEPLOY_CODE_MAX_BYTES, type Manifest } from "@platform/types";
+import { LogBinding, type LogEntry } from "@platform/bindings";
+import { DEFAULT_LIMITS, PLATFORM_LIMITS, DEPLOY_CODE_MAX_BYTES, manifestSchema, type Manifest } from "@platform/types";
 import { notFound, payloadTooLarge, limitExceeded, HttpError } from "../errors.js";
 
 export interface WorkersServiceDeps {
@@ -30,9 +32,14 @@ export interface WorkersServiceDeps {
   dataDir: string;
   /** Egress allowlist; ["*"] allows all public domains. */
   egressAllowedDomains: string[];
+  egressTimeoutMs: number;
+  maxResponseBytes: number;
+  redis: Redis;
   /** Log binding for writing request logs */
   logs: LogBinding;
 }
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export class WorkersService {
   constructor(private readonly deps: WorkersServiceDeps) {}
@@ -41,8 +48,8 @@ export class WorkersService {
     runtime: string;
     limits?: Partial<{ cpu_ms: number; memory_mb: number; concurrency: number }>;
   }) {
-    const existing = await this.deps.workers.listActive(1000, 0);
-    if (existing.length >= PLATFORM_LIMITS.max_workers) {
+    const existing = await this.deps.workers.countActive();
+    if (existing >= PLATFORM_LIMITS.max_workers) {
       throw limitExceeded(`platform worker limit (${PLATFORM_LIMITS.max_workers}) reached`);
     }
 
@@ -54,6 +61,7 @@ export class WorkersService {
   }
 
   async getWorker(id: string) {
+    if (!UUID_RE.test(id)) throw notFound("worker", id);
     const worker = await this.deps.workers.findActive(id);
     if (!worker) throw notFound("worker", id);
     return worker;
@@ -76,6 +84,13 @@ export class WorkersService {
   async deleteWorker(id: string) {
     await this.getWorker(id);
     await this.deps.isolates.stop(id);
+    let cursor = "0";
+    do {
+      const [next, keys] = (await this.deps.redis.scan(cursor, "MATCH", `wp:${id}:*`, "COUNT", 500)) as [string, string[]];
+      cursor = next;
+      if (keys.length > 0) await this.deps.redis.del(...keys);
+    } while (cursor !== "0");
+    await rm(join(this.deps.dataDir, "d1", id), { recursive: true, force: true });
     await this.deps.workers.softDelete(id);
   }
 
@@ -98,27 +113,27 @@ export class WorkersService {
     }
 
     const versions = await this.deps.versions.listByWorker(worker.id, PLATFORM_LIMITS.max_deploy_versions_per_worker, 0);
-    void versions; // history retained; ceiling enforced by retention job
+    if (versions.length >= PLATFORM_LIMITS.max_deploy_versions_per_worker) {
+      throw limitExceeded(`maximum of ${PLATFORM_LIMITS.max_deploy_versions_per_worker} versions per worker reached`);
+    }
 
     const code = input.code.toString("utf8");
     const codeHash = createHash("sha256").update(code).digest("hex");
 
-    const manifest = {
-      entrypoint: input.manifest?.entrypoint ?? "src/index.ts",
-      bindings: input.manifest?.bindings ?? { d1_databases: [], kv_namespaces: [], queues: [], secrets: [] },
-      limits: input.manifest?.limits ?? {},
-      compatibility_date: input.manifest?.compatibility_date ?? "2026-10-10",
-      node_compat: input.manifest?.node_compat ?? true,
-    };
+    const parsedManifest = manifestSchema.safeParse(input.manifest ?? {});
+    if (!parsedManifest.success) throw new HttpError(400, "VALIDATION_ERROR", "invalid worker manifest", parsedManifest.error.issues);
+    const manifest = parsedManifest.data;
+    const allBindingNames = [
+      ...manifest.bindings.d1_databases,
+      ...manifest.bindings.kv_namespaces,
+      ...manifest.bindings.queues,
+    ];
+    if (new Set(allBindingNames).size !== allBindingNames.length) {
+      throw new HttpError(400, "VALIDATION_ERROR", "binding names must be unique across types");
+    }
 
-    const version = await this.deps.versions.create({
-      workerId: worker.id,
-      codeHash,
-      bundleSize: input.code.byteLength,
-      code,
-      manifest: manifest as unknown as Record<string, unknown>,
-    });
-
+    // Resolve effective bindings before persisting the version so invalid
+    // manifests do not leave orphaned versions in the catalog.
     // Sync effective bindings for the runtime env
     const bindingRows: Array<{ bindingType: string; bindingName: string; configJson?: Record<string, unknown> }> = [];
     for (const name of manifest.bindings.d1_databases ?? []) {
@@ -136,24 +151,33 @@ export class WorkersService {
       if (!q) throw notFound(`queue "${name}" is not created for this worker`);
       bindingRows.push({ bindingType: "queue", bindingName: name });
     }
+    const version = await this.deps.versions.create({
+      workerId: worker.id,
+      codeHash,
+      bundleSize: input.code.byteLength,
+      code,
+      manifest: manifest as unknown as Record<string, unknown>,
+    });
+    const previousPromoted = await this.deps.versions.findPromoted(worker.id);
+    const previousBindings = await this.deps.bindingsRepo.listForWorker(worker.id);
     await this.deps.bindingsRepo.syncForWorker(worker.id, bindingRows);
+
+    // Decrypt all secrets before changing the production pointer. A malformed
+    // envelope must not leave the catalog promoted to a version that cannot run.
+    const secretNames = await this.deps.secretsRepo.listNames(worker.id);
+    const secrets: Record<string, string> = {};
+    for (const name of secretNames) {
+      const envelope = await this.deps.secretsRepo.getDecryptedSource(worker.id, name);
+      if (envelope) secrets[name] = this.deps.secretCrypto.decrypt(worker.id, envelope);
+    }
 
     // Promote atomically
     const promoted = await this.deps.versions.promote(worker.id, version.id);
     if (!promoted) throw notFound("version", version.id);
 
-    // Decrypt all secrets for injection into the isolate
-    const secretNames = await this.deps.secretsRepo.listNames(worker.id);
-    const secrets: Record<string, string> = {};
-    for (const name of secretNames) {
-      const envelope = await this.deps.secretsRepo.getDecryptedSource(worker.id, name);
-      if (envelope) {
-        secrets[name] = this.deps.secretCrypto.decrypt(worker.id, envelope);
-      }
-    }
-
     // Hot reload or cold start the isolate
-    await this.deps.isolates.deploy({
+    try {
+      await this.deps.isolates.deploy({
       workerId: worker.id,
       versionId: version.id,
       code,
@@ -168,10 +192,28 @@ export class WorkersService {
         memory_mb: (worker.limits.memory_mb as number) ?? DEFAULT_LIMITS.memory_mb,
         concurrency: (worker.limits.concurrency as number) ?? DEFAULT_LIMITS.concurrency,
       },
-      egress: { allowedDomains: this.deps.egressAllowedDomains },
-    });
+        egress: { allowedDomains: this.deps.egressAllowedDomains, timeoutMs: this.deps.egressTimeoutMs },
+      });
+    } catch (error) {
+      await this.deps.bindingsRepo.syncForWorker(worker.id, previousBindings);
+      if (previousPromoted) await this.deps.versions.promote(worker.id, previousPromoted.id);
+      else await this.deps.versions.clearPromotion(worker.id);
+      try {
+        if (previousPromoted) await this.deployStored(worker.id, previousPromoted);
+        else await this.deps.isolates.stop(worker.id);
+      } catch {
+        // Preserve the original deploy error; recovery is retried on restart.
+      }
+      throw error;
+    }
 
     return { version, promoted };
+  }
+
+  async reloadPromoted(workerId: string): Promise<void> {
+    const promoted = await this.deps.versions.findPromoted(workerId);
+    if (!promoted) return;
+    await this.deployStored(workerId, promoted);
   }
 
   async listVersions(workerId: string, limit: number, offset: number) {
@@ -183,21 +225,80 @@ export class WorkersService {
     await this.getWorker(workerId);
     const version = await this.deps.versions.find(versionId);
     if (!version || version.workerId !== workerId) throw notFound("version", versionId);
+    const previous = await this.deps.versions.findPromoted(workerId);
 
     const promoted = await this.deps.versions.promote(workerId, versionId);
     if (!promoted) throw notFound("version", versionId);
 
-    // Re-deploy from stored code (hot reload)
-    await this.deployStored(workerId, promoted);
-    return promoted;
+    try {
+      await this.deployStored(workerId, promoted);
+      return promoted;
+    } catch (error) {
+      if (previous) {
+        await this.deps.versions.promote(workerId, previous.id);
+        await this.deployStored(workerId, previous).catch(() => {});
+      } else {
+        await this.deps.versions.clearPromotion(workerId);
+        await this.deps.isolates.stop(workerId).catch(() => {});
+      }
+      throw error;
+    }
   }
 
   async rollback(workerId: string) {
     await this.getWorker(workerId);
+    const current = await this.deps.versions.findPromoted(workerId);
     const previous = await this.deps.versions.rollback(workerId);
     if (!previous) throw notFound("previous version to roll back to");
-    await this.deployStored(workerId, previous);
-    return previous;
+    try {
+      await this.deployStored(workerId, previous);
+      return previous;
+    } catch (error) {
+      if (current) {
+        await this.deps.versions.promote(workerId, current.id);
+        await this.deployStored(workerId, current).catch(() => {});
+      }
+      throw error;
+    }
+  }
+
+  async deleteD1(workerId: string, name: string): Promise<void> {
+    await this.getWorker(workerId);
+    const db = await this.deps.d1Catalog.findByWorkerAndName(workerId, name);
+    if (!db) throw notFound("D1 database", `${workerId}/${name}`);
+    await this.deps.isolates.stop(workerId);
+    await this.deps.d1Catalog.delete(workerId, name);
+    await this.deps.bindingsRepo.remove(workerId, "d1", name);
+    await rm(db.filePath, { force: true }).catch(() => {});
+    await this.reloadPromoted(workerId);
+  }
+
+  async deleteKv(workerId: string, name: string): Promise<void> {
+    await this.getWorker(workerId);
+    const namespace = await this.deps.kvCatalog.findByWorkerAndName(workerId, name);
+    if (!namespace) throw notFound("KV namespace", `${workerId}/${name}`);
+    await this.deps.isolates.stop(workerId);
+    let cursor = "0";
+    const pattern = `wp:${workerId}:kv:${name}:*`;
+    do {
+      const [next, keys] = (await this.deps.redis.scan(cursor, "MATCH", pattern, "COUNT", 500)) as [string, string[]];
+      cursor = next;
+      if (keys.length > 0) await this.deps.redis.del(...keys);
+    } while (cursor !== "0");
+    await this.deps.kvCatalog.delete(workerId, name);
+    await this.deps.bindingsRepo.remove(workerId, "kv", name);
+    await this.reloadPromoted(workerId);
+  }
+
+  async deleteQueue(workerId: string, name: string): Promise<void> {
+    await this.getWorker(workerId);
+    const queue = await this.deps.queuesCatalog.findByWorkerAndName(workerId, name);
+    if (!queue) throw notFound("queue", `${workerId}/${name}`);
+    await this.deps.isolates.stop(workerId);
+    await this.deps.redis.del(`wp:${workerId}:queue:${name}`, `wp:${workerId}:queue:${name}:dlq`);
+    await this.deps.queuesCatalog.delete(workerId, name);
+    await this.deps.bindingsRepo.remove(workerId, "queue", name);
+    await this.reloadPromoted(workerId);
   }
 
   async deleteVersion(workerId: string, versionId: string) {
@@ -249,24 +350,33 @@ export class WorkersService {
         memory_mb: (worker.limits.memory_mb as number) ?? DEFAULT_LIMITS.memory_mb,
         concurrency: (worker.limits.concurrency as number) ?? DEFAULT_LIMITS.concurrency,
       },
-      egress: { allowedDomains: this.deps.egressAllowedDomains },
+      egress: { allowedDomains: this.deps.egressAllowedDomains, timeoutMs: this.deps.egressTimeoutMs },
     });
   }
 
   async invoke(workerId: string, input: { method: string; path: string; query?: Record<string, string>; headers?: Record<string, string>; body?: string }) {
-    await this.getWorker(workerId);
+    const worker = await this.getWorker(workerId);
+    if (worker.status !== "active") throw new HttpError(503, "WORKER_PAUSED", `worker "${workerId}" is paused`);
     if (!this.deps.isolates.isDeployed(workerId)) {
       throw notFound(`deployed worker "${workerId}" — promote a version first`);
     }
     const startedAt = Date.now();
-    const result = await this.deps.isolates.invoke({
-      workerId,
-      method: input.method,
-      path: input.path,
-      query: input.query,
-      headers: input.headers,
-      body: input.body,
-    });
+    let result;
+    try {
+      result = await this.deps.isolates.invoke({
+        workerId,
+        method: input.method,
+        path: input.path,
+        query: input.query,
+        headers: input.headers,
+        body: input.body,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.name === "ResponseTooLargeError") {
+        throw new HttpError(502, "WORKER_RESPONSE_TOO_LARGE", `worker response exceeds ${this.deps.maxResponseBytes} bytes`);
+      }
+      throw error;
+    }
     const latencyMs = Date.now() - startedAt;
 
     await this.deps.usage.recordSample(workerId, {
@@ -315,14 +425,22 @@ export class WorkersService {
     }
 
     const startedAt = Date.now();
-    const result = await this.deps.isolates.invoke({
-      workerId,
-      method: input.method,
-      path: input.path,
-      query: input.query,
-      headers: input.headers,
-      body: input.body,
-    });
+    let result;
+    try {
+      result = await this.deps.isolates.invoke({
+        workerId,
+        method: input.method,
+        path: input.path,
+        query: input.query,
+        headers: input.headers,
+        body: input.body,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.name === "ResponseTooLargeError") {
+        throw new HttpError(502, "WORKER_RESPONSE_TOO_LARGE", `worker response exceeds ${this.deps.maxResponseBytes} bytes`);
+      }
+      throw error;
+    }
     const latencyMs = Date.now() - startedAt;
 
     await this.deps.usage.recordSample(workerId, {
@@ -351,7 +469,7 @@ export class WorkersService {
 
   private async writeLog(entry: LogEntry): Promise<void> {
     try {
-      await this.deps.logs.write(entry);
+      await new LogBinding(entry.workerId, this.deps.redis, { maxLen: 100_000 }).write(entry);
     } catch (err) {
       // Log write failures must not break the request
       console.error("[log] write failed:", err);

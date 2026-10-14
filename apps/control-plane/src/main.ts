@@ -66,6 +66,8 @@ function loadConfig(): AppConfig {
           .filter((d) => d.length > 0)
       : ["*"],
     apiKey: process.env.API_KEY || undefined,
+    egressTimeoutMs: intEnv("EGRESS_TIMEOUT_MS", 120_000),
+    maxResponseBytes: intEnv("MAX_RESPONSE_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
     maxBodyBytes: intEnv("MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
     /** Rate limiting for public worker ingress (per IP+worker). */
     ingressRateLimitPerMinute: intEnv("INGRESS_RATE_LIMIT_PER_MINUTE", 300),
@@ -257,7 +259,8 @@ async function main() {
     redis,
     libsql,
     d1FilePath: (workerId, name) => `${config.dataDir}/d1/${workerId}/${name}.sqlite`,
-    egressDefaults: { allowedDomains: config.egressAllowedDomains },
+    egressDefaults: { allowedDomains: config.egressAllowedDomains, timeoutMs: config.egressTimeoutMs },
+    maxResponseBytes: config.maxResponseBytes,
     bindingUsageHooks: {
       onRowsRead: (wid, rows) => usageBuffer.onRowsRead(wid, rows),
       onRowsWritten: (wid, rows) => usageBuffer.onRowsWritten(wid, rows),
@@ -269,7 +272,12 @@ async function main() {
 
   // --- Warm-up: restore deployed workers from the catalog --------------------
   try {
-    const activeWorkers = await repositories.workers.listActive(1000, 0);
+    const activeWorkers = [];
+    for (let offset = 0; ; offset += 1000) {
+      const page = await repositories.workers.listActive(1000, offset);
+      activeWorkers.push(...page);
+      if (page.length < 1000) break;
+    }
     let restored = 0;
     for (const worker of activeWorkers) {
       const promoted = await repositories.versions.findPromoted(worker.id);
@@ -299,7 +307,7 @@ async function main() {
             memory_mb: (worker.limits.memory_mb as number) ?? 128,
             concurrency: (worker.limits.concurrency as number) ?? 100,
           },
-          egress: { allowedDomains: config.egressAllowedDomains },
+          egress: { allowedDomains: config.egressAllowedDomains, timeoutMs: config.egressTimeoutMs },
         });
         restored++;
       } catch (error) {
@@ -327,10 +335,14 @@ async function main() {
       secretCrypto,
       dataDir: config.dataDir,
       egressAllowedDomains: config.egressAllowedDomains,
+      egressTimeoutMs: config.egressTimeoutMs,
+      maxResponseBytes: config.maxResponseBytes,
+      redis,
       logs,
     }),
     logger,
     logs,
+    redis,
     scanIntervalMs: 30_000,
     batchSize: 100,
     logRetentionIntervalMs: intEnv("LOG_RETENTION_INTERVAL_MS", 60 * 60 * 1000), // 1 hour

@@ -2,6 +2,7 @@ import type { CronJobsRepository } from "@platform/catalog";
 import type { WorkersService } from "../services/workers-service.js";
 import type { Logger } from "@platform/observability";
 import type { LogBinding } from "@platform/bindings";
+import type { Redis } from "ioredis";
 import { getNextRunTime } from "../utils/cron.js";
 
 export interface CronSchedulerDeps {
@@ -10,6 +11,7 @@ export interface CronSchedulerDeps {
   logger: Logger;
   /** Log binding for retention cleanup */
   logs: LogBinding;
+  redis: Redis;
   /** How often to scan for due jobs (ms). Default 30s. */
   scanIntervalMs?: number;
   /** Max jobs to process per scan. Default 100. */
@@ -32,6 +34,7 @@ export class CronScheduler {
       workersService: deps.workersService,
       logger: deps.logger,
       logs: deps.logs,
+      redis: deps.redis,
       scanIntervalMs: deps.scanIntervalMs ?? 30_000,
       batchSize: deps.batchSize ?? 100,
       logRetentionIntervalMs: deps.logRetentionIntervalMs ?? 60 * 60 * 1000, // 1 hour
@@ -72,7 +75,7 @@ export class CronScheduler {
     if (!this.running) return;
     try {
       const olderThan = new Date(Date.now() - this.deps.logRetentionSeconds * 1000);
-      const removed = await this.deps.logs.trimByTime(olderThan);
+      const removed = await this.deps.logs.trimAllByTime(olderThan);
       if (removed > 0) {
         this.deps.logger.info({ removed, olderThan: olderThan.toISOString() }, "log retention: trimmed old entries");
       }
@@ -84,6 +87,16 @@ export class CronScheduler {
   private async tick(): Promise<void> {
     if (!this.running) return;
     const startedAt = Date.now();
+    const lockKey = "wp:cron:scheduler:lock";
+    const lockToken = `${process.pid}:${Date.now()}:${Math.random()}`;
+    let acquired: string | null = null;
+    try {
+      acquired = await this.deps.redis.set(lockKey, lockToken, "PX", "300000", "NX");
+    } catch (error) {
+      this.deps.logger.error({ error: String(error) }, "cron scheduler lock acquisition failed");
+      return;
+    }
+    if (acquired !== "OK") return;
     try {
       const dueJobs = await this.deps.cronJobs.listDue(this.deps.batchSize);
       if (dueJobs.length === 0) return;
@@ -97,7 +110,9 @@ export class CronScheduler {
       this.deps.logger.error({ error: String(error) }, "cron scheduler tick failed");
     } finally {
       const duration = Date.now() - startedAt;
-      // metrics removed for now - can be added when metrics are available
+      const current = await this.deps.redis.get(lockKey).catch(() => null);
+      if (current === lockToken) await this.deps.redis.del(lockKey);
+      void duration;
     }
   }
 

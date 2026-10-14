@@ -474,6 +474,17 @@ render_nginx_conf() {
       -e "s|__ACTIVE_PORT__|${active_port}|g" \
       "$template" > "$RENDERED_FILE"
 
+  # Redirect plain HTTP only when TLS is available. Before first certificate
+  # issuance HTTP must continue serving the ACME challenge and the app.
+  local cert="${TLS_CERT_FILE:-/etc/letsencrypt/live/${DOMAIN}/fullchain.pem}"
+  local key="${TLS_KEY_FILE:-/etc/letsencrypt/live/${DOMAIN}/privkey.pem}"
+  if [[ -f "$cert" && -f "$key" ]]; then
+    sed -i.bak 's|        # __HTTP_REDIRECT__|        return 301 https://$host$request_uri;|' "$RENDERED_FILE"
+  else
+    sed -i.bak '/        # __HTTP_REDIRECT__/d' "$RENDERED_FILE"
+  fi
+  rm -f "${RENDERED_FILE}.bak"
+
   if grep -vE '^[[:space:]]*#' "$RENDERED_FILE" | grep -Eq '__[A-Z_]+__'; then
     err "unreplaced placeholders left in rendered nginx conf:"
     grep -Eo '__[A-Z_]+__' "$RENDERED_FILE" | sort -u >&2 || true
@@ -483,8 +494,6 @@ render_nginx_conf() {
   # TLS: append the 443 block only when the cert already exists, so deploys
   # neither reference missing files nor wipe a working TLS setup.
   # (certbot --nginx would be wiped on the next deploy — use certonly --webroot.)
-  local cert="${TLS_CERT_FILE:-/etc/letsencrypt/live/${DOMAIN}/fullchain.pem}"
-  local key="${TLS_KEY_FILE:-/etc/letsencrypt/live/${DOMAIN}/privkey.pem}"
   if [[ -f "$cert" && -f "$key" ]]; then
     local snippet="${SCRIPT_DIR}/nginx.tls-snippet.template"
     [[ -f "$snippet" ]] || die "nginx TLS snippet not found: $snippet"
@@ -693,6 +702,7 @@ start_slot() {
     -e API_RATE_LIMIT_PER_MINUTE="${API_RATE_LIMIT_PER_MINUTE:-600}" \
     -e API_RATE_LIMIT_BURST="${API_RATE_LIMIT_BURST:-100}" \
     -e MAX_BODY_BYTES="${MAX_BODY_BYTES:-10485760}" \
+    -e MAX_RESPONSE_BODY_BYTES="${MAX_RESPONSE_BODY_BYTES:-10485760}" \
     -e TRUSTED_PROXIES="${TRUSTED_PROXIES:-}" \
     -e CORS_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS:-}" \
     -e METRICS_TOKEN="${METRICS_TOKEN:-}" \

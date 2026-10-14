@@ -4,6 +4,7 @@ import { badRequest } from "../errors.js";
 import { workerCreateSchema, workerUpdateSchema, invokeSchema } from "@platform/types";
 import { readBodyCapped } from "../body-limit.js";
 import { LogBinding, type LogQuery } from "@platform/bindings";
+import type { Redis } from "ioredis";
 
 function serializeWorker(w: {
   id: string;
@@ -23,7 +24,7 @@ function serializeWorker(w: {
   };
 }
 
-export function workersRoutes(deps: { workersService: WorkersService; maxBodyBytes: number; logs: LogBinding }): Hono {
+export function workersRoutes(deps: { workersService: WorkersService; maxBodyBytes: number; redis: Redis; logs: LogBinding }): Hono {
   const app = new Hono();
 
   // --- Workers CRUD -------------------------------------------------------
@@ -36,8 +37,13 @@ export function workersRoutes(deps: { workersService: WorkersService; maxBodyByt
   });
 
   app.get("/workers", async (c) => {
-    const limit = Math.min(Number(c.req.query("limit") ?? 50), 200);
-    const offset = Math.max(Number(c.req.query("offset") ?? 0), 0);
+    const requestedLimit = Number(c.req.query("limit") ?? 50);
+    const requestedOffset = Number(c.req.query("offset") ?? 0);
+    if (!Number.isInteger(requestedLimit) || !Number.isInteger(requestedOffset) || requestedLimit < 0 || requestedOffset < 0) {
+      throw badRequest("limit and offset must be non-negative integers");
+    }
+    const limit = Math.min(requestedLimit, 200);
+    const offset = requestedOffset;
     const { items, total } = await deps.workersService.listWorkers(limit, offset);
     return c.json({
       data: items.map(serializeWorker),
@@ -71,10 +77,17 @@ export function workersRoutes(deps: { workersService: WorkersService; maxBodyByt
     let manifest: Record<string, unknown> | undefined;
 
     if (contentType.includes("multipart/form-data")) {
+      const contentLength = Number(c.req.header("content-length") ?? "NaN");
+      if (!Number.isFinite(contentLength) || contentLength > deps.maxBodyBytes) {
+        throw badRequest("multipart deploy requires Content-Length within the request size limit");
+      }
       const form = await c.req.formData();
       const file = form.get("code");
       if (!(file instanceof File)) throw badRequest("multipart field 'code' (file) is required");
       code = Buffer.from(await file.arrayBuffer());
+      if (code.byteLength > 5 * 1024 * 1024) {
+        throw badRequest("worker code exceeds the 5 MB deploy limit");
+      }
       const manifestRaw = form.get("manifest");
       if (typeof manifestRaw === "string" && manifestRaw.length > 0) {
         try {
@@ -114,8 +127,13 @@ export function workersRoutes(deps: { workersService: WorkersService; maxBodyByt
   });
 
   app.get("/workers/:id/versions", async (c) => {
-    const limit = Math.min(Number(c.req.query("limit") ?? 50), 200);
-    const offset = Math.max(Number(c.req.query("offset") ?? 0), 0);
+    const requestedLimit = Number(c.req.query("limit") ?? 50);
+    const requestedOffset = Number(c.req.query("offset") ?? 0);
+    if (!Number.isInteger(requestedLimit) || !Number.isInteger(requestedOffset) || requestedLimit < 0 || requestedOffset < 0) {
+      throw badRequest("limit and offset must be non-negative integers");
+    }
+    const limit = Math.min(requestedLimit, 200);
+    const offset = requestedOffset;
     const versions = await deps.workersService.listVersions(c.req.param("id"), limit, offset);
     return c.json({
       data: versions.map((v) => ({
@@ -183,15 +201,20 @@ export function workersRoutes(deps: { workersService: WorkersService; maxBodyByt
     const workerId = c.req.param("id");
     await deps.workersService.getWorker(workerId); // validate worker exists
 
+    const requestedLogLimit = Number(c.req.query("limit") ?? 100);
+    if (!Number.isInteger(requestedLogLimit) || requestedLogLimit < 1) throw badRequest("log limit must be a positive integer");
+    const since = c.req.query("since");
+    const until = c.req.query("until");
+    if ((since && Number.isNaN(Date.parse(since))) || (until && Number.isNaN(Date.parse(until)))) throw badRequest("since and until must be valid dates");
     const query: LogQuery = {
-      since: c.req.query("since"),
-      until: c.req.query("until"),
-      limit: c.req.query("limit") ? Math.min(Number(c.req.query("limit")!), 1000) : 100,
+      since,
+      until,
+      limit: Math.min(requestedLogLimit, 1000),
       level: c.req.query("level") as "info" | "warn" | "error" | undefined,
       cursor: c.req.query("cursor"),
     };
 
-    const result = await deps.logs.read(query);
+    const result = await new LogBinding(workerId, deps.redis, { maxLen: 100_000 }).read(query);
     return c.json({ data: result });
   });
 

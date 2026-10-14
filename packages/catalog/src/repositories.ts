@@ -127,12 +127,24 @@ export class VersionsRepository {
     return rows[0] as VersionRow | undefined;
   }
 
+  async clearPromotion(workerId: string): Promise<void> {
+    await this.db.update(workerVersions)
+      .set({ promotedAt: null })
+      .where(and(eq(workerVersions.workerId, workerId), isNotNull(workerVersions.promotedAt)));
+  }
+
   /**
    * Atomically promote a version: un-promote any current production version
    * and stamp the target. Executed in a single transaction.
    */
   async promote(workerId: string, versionId: string): Promise<VersionRow | undefined> {
     return this.db.transaction(async (tx) => {
+      const target = await tx.select({ id: workerVersions.id })
+        .from(workerVersions)
+        .where(and(eq(workerVersions.id, versionId), eq(workerVersions.workerId, workerId)))
+        .limit(1);
+      if (target.length === 0) return undefined;
+
       await tx
         .update(workerVersions)
         .set({ promotedAt: null })
@@ -204,6 +216,14 @@ export class BindingsRepository {
         );
       }
     });
+  }
+
+  async remove(workerId: string, bindingType: string, bindingName: string): Promise<void> {
+    await this.db.delete(workerBindings).where(and(
+      eq(workerBindings.workerId, workerId),
+      eq(workerBindings.bindingType, bindingType),
+      eq(workerBindings.bindingName, bindingName),
+    ));
   }
 
   async listForWorker(
