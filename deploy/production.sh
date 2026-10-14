@@ -645,6 +645,7 @@ run_migrations() {
   log "migrations: applying from image ${image} (backup already taken)"
   if docker run --rm --network "$NETWORK" \
       -e DATABASE_URL="$(encoded_database_url)" \
+      -e SECRETS_MASTER_KEY="${SECRETS_MASTER_KEY:-}" \
       "$image" node packages/catalog/dist/migrate-cli.js >&2; then
     log "migrations: up to date"
   else

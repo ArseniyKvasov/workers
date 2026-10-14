@@ -38,13 +38,30 @@ fi
 
 # Fail fast with a clear message (the in-app preflight repeats these checks
 # with retries, but an early explicit error is easier to spot in docker logs).
+#
+# Strictness depends on what is being launched: the control plane itself
+# REQUIRES both vars, but utility commands (migrate-cli, backup shells,
+# one-off node -e) only need DATABASE_URL — requiring the master key there
+# broke `./deploy/production.sh` migrations, which run without it.
+_running_server=0
+for _arg in "$@"; do
+  case "$_arg" in
+    *control-plane/dist/main.js) _running_server=1; break ;;
+  esac
+done
+unset _arg
+
 if [ -z "${DATABASE_URL:-}" ]; then
   echo "[entrypoint] FATAL: DATABASE_URL is not set and could not be built from POSTGRES_* parts" >&2
   exit 1
 fi
 if [ -z "${SECRETS_MASTER_KEY:-}" ]; then
-  echo "[entrypoint] FATAL: SECRETS_MASTER_KEY is not set" >&2
-  exit 1
+  if [ "$_running_server" -eq 1 ]; then
+    echo "[entrypoint] FATAL: SECRETS_MASTER_KEY is not set" >&2
+    exit 1
+  else
+    echo "[entrypoint] WARN: SECRETS_MASTER_KEY is not set (not required for utility command: $1)" >&2
+  fi
 fi
 if [ -z "${API_KEY:-}" ]; then
   echo "[entrypoint] WARN: API_KEY is not set — every /api/* request will 401" >&2
