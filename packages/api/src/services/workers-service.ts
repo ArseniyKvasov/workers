@@ -136,6 +136,7 @@ export class WorkersService {
     // manifests do not leave orphaned versions in the catalog.
     // Sync effective bindings for the runtime env
     const bindingRows: Array<{ bindingType: string; bindingName: string; configJson?: Record<string, unknown> }> = [];
+    const queueOptions: Record<string, { maxRetries: number }> = {};
     for (const name of manifest.bindings.d1_databases ?? []) {
       const db = await this.deps.d1Catalog.findByWorkerAndName(worker.id, name);
       if (!db) throw notFound(`D1 database "${name}" is not created for this worker`);
@@ -149,7 +150,8 @@ export class WorkersService {
     for (const name of manifest.bindings.queues ?? []) {
       const q = await this.deps.queuesCatalog.findByWorkerAndName(worker.id, name);
       if (!q) throw notFound(`queue "${name}" is not created for this worker`);
-      bindingRows.push({ bindingType: "queue", bindingName: name });
+      queueOptions[name] = { maxRetries: q.maxRetries };
+      bindingRows.push({ bindingType: "queue", bindingName: name, configJson: { maxRetries: q.maxRetries, retentionSeconds: q.retentionSeconds } });
     }
     const version = await this.deps.versions.create({
       workerId: worker.id,
@@ -186,6 +188,7 @@ export class WorkersService {
         kv_namespaces: manifest.bindings.kv_namespaces ?? [],
         queues: manifest.bindings.queues ?? [],
       },
+      queueOptions,
       secrets,
       limits: {
         cpu_ms: (worker.limits.cpu_ms as number) ?? DEFAULT_LIMITS.cpu_ms,
@@ -338,12 +341,16 @@ export class WorkersService {
     const d1Names = bindingRows.filter((b) => b.bindingType === "d1").map((b) => b.bindingName);
     const kvNames = bindingRows.filter((b) => b.bindingType === "kv").map((b) => b.bindingName);
     const queueNames = bindingRows.filter((b) => b.bindingType === "queue").map((b) => b.bindingName);
+    const queueOptions = Object.fromEntries(bindingRows
+      .filter((b) => b.bindingType === "queue")
+      .map((b) => [b.bindingName, { maxRetries: Number(b.configJson.maxRetries ?? 3) }]));
 
     await this.deps.isolates.deploy({
       workerId,
       versionId: version.id,
       code: version.code,
       bindings: { d1_databases: d1Names, kv_namespaces: kvNames, queues: queueNames },
+      queueOptions,
       secrets,
       limits: {
         cpu_ms: (worker.limits.cpu_ms as number) ?? DEFAULT_LIMITS.cpu_ms,
@@ -374,6 +381,9 @@ export class WorkersService {
     } catch (error) {
       if (error instanceof Error && error.name === "ResponseTooLargeError") {
         throw new HttpError(502, "WORKER_RESPONSE_TOO_LARGE", `worker response exceeds ${this.deps.maxResponseBytes} bytes`);
+      }
+      if (error instanceof Error && error.name === "WorkerMemoryLimitError") {
+        throw new HttpError(429, "WORKER_MEMORY_LIMIT", "worker memory budget is exhausted");
       }
       throw error;
     }
@@ -438,6 +448,9 @@ export class WorkersService {
     } catch (error) {
       if (error instanceof Error && error.name === "ResponseTooLargeError") {
         throw new HttpError(502, "WORKER_RESPONSE_TOO_LARGE", `worker response exceeds ${this.deps.maxResponseBytes} bytes`);
+      }
+      if (error instanceof Error && error.name === "WorkerMemoryLimitError") {
+        throw new HttpError(429, "WORKER_MEMORY_LIMIT", "worker memory budget is exhausted");
       }
       throw error;
     }

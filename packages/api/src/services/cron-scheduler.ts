@@ -97,6 +97,16 @@ export class CronScheduler {
       return;
     }
     if (acquired !== "OK") return;
+    const heartbeat = setInterval(() => {
+      void this.deps.redis.eval(
+        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end",
+        1,
+        lockKey,
+        lockToken,
+        "300000",
+      ).catch((error) => this.deps.logger.warn({ error: String(error) }, "cron scheduler lease heartbeat failed"));
+    }, 60_000);
+    heartbeat.unref?.();
     try {
       const dueJobs = await this.deps.cronJobs.listDue(this.deps.batchSize);
       if (dueJobs.length === 0) return;
@@ -109,6 +119,7 @@ export class CronScheduler {
     } catch (error) {
       this.deps.logger.error({ error: String(error) }, "cron scheduler tick failed");
     } finally {
+      clearInterval(heartbeat);
       const duration = Date.now() - startedAt;
       const current = await this.deps.redis.get(lockKey).catch(() => null);
       if (current === lockToken) await this.deps.redis.del(lockKey);

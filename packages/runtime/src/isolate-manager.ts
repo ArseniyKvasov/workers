@@ -19,6 +19,7 @@ export interface IsolateDeployInput {
     kv_namespaces?: string[];
     queues?: string[];
   };
+  queueOptions?: Record<string, { maxRetries?: number }>;
   secrets: Record<string, string>;
   limits: { cpu_ms: number; memory_mb: number; concurrency: number };
   egress: EgressConfig;
@@ -51,6 +52,13 @@ export class ResponseTooLargeError extends Error {
   }
 }
 
+export class WorkerMemoryLimitError extends Error {
+  constructor(public readonly maxBytes: number) {
+    super(`worker memory budget exceeded (${maxBytes} bytes)`);
+    this.name = "WorkerMemoryLimitError";
+  }
+}
+
 export interface IsolateRuntimeDeps {
   redis: Redis;
   libsql: LibSQLClient;
@@ -72,6 +80,8 @@ interface WorkerIsolate {
   concurrency: number;
   services: { d1: ServiceHandler; kv: ServiceHandler; queue: ServiceHandler; logs: ServiceHandler; dispose: () => Promise<void> };
   inFlight: number;
+  reservedBytes: number;
+  memoryBudgetBytes: number;
   draining: boolean;
 }
 
@@ -111,6 +121,8 @@ export class IsolateManager {
       concurrency: Math.max(MAX_CONCURRENCY_FLOOR, input.limits.concurrency),
       services,
       inFlight: 0,
+      reservedBytes: 0,
+      memoryBudgetBytes: Math.max(64, input.limits.memory_mb) * 1024 * 1024,
       draining: false,
     };
     this.isolates.set(input.workerId, isolate);
@@ -122,6 +134,7 @@ export class IsolateManager {
     await isolate.mf.setOptions(options);
     isolate.versionId = input.versionId;
     isolate.concurrency = Math.max(MAX_CONCURRENCY_FLOOR, input.limits.concurrency);
+    isolate.memoryBudgetBytes = Math.max(64, input.limits.memory_mb) * 1024 * 1024;
   }
 
   private createServices(input: IsolateDeployInput) {
@@ -130,6 +143,7 @@ export class IsolateManager {
       redis: this.deps.redis,
       libsql: this.deps.libsql,
       d1FilePath: this.deps.d1FilePath,
+      queueOptions: input.queueOptions,
       hooks: {
         onRowsRead: (wid, rows) => {
           this.metrics.d1RowsRead.inc({ worker_id: wid }, rows);
@@ -210,7 +224,17 @@ export class IsolateManager {
       throw err;
     }
 
+    const requestBytes = typeof input.body === "string" ? Buffer.byteLength(input.body) : input.body?.byteLength ?? 0;
+    const responseBudget = Math.min(this.deps.maxResponseBytes, Math.floor(isolate.memoryBudgetBytes / 2));
+    const reservation = requestBytes + responseBudget;
+    if (isolate.reservedBytes + reservation > isolate.memoryBudgetBytes) {
+      const err = new WorkerMemoryLimitError(isolate.memoryBudgetBytes);
+      this.metrics.requestsTotal.inc({ worker_id: input.workerId, status: "429" });
+      throw err;
+    }
+
     isolate.inFlight++;
+    isolate.reservedBytes += reservation;
     const startedAt = Date.now();
     const requestId = randomUUID();
 
@@ -237,11 +261,11 @@ export class IsolateManager {
       } as unknown as Parameters<typeof isolate.mf.dispatchFetch>[1]);
 
       const declaredLength = Number(response.headers.get("content-length") ?? "NaN");
-      if (Number.isFinite(declaredLength) && declaredLength > this.deps.maxResponseBytes) {
+      if (Number.isFinite(declaredLength) && declaredLength > responseBudget) {
         await response.body?.cancel();
-        throw new ResponseTooLargeError(this.deps.maxResponseBytes);
+        throw new ResponseTooLargeError(responseBudget);
       }
-      const body = await this.readResponseBody(response);
+      const body = await this.readResponseBody(response, responseBudget);
 
       const headers: Record<string, string> = {};
       response.headers.forEach((value, key) => {
@@ -263,20 +287,22 @@ export class IsolateManager {
       const isEgress = error instanceof Error && error.name === "EgressBlockedError";
       const isConcurrency = error instanceof Error && error.name === "ConcurrencyLimitError";
       const isResponseTooLarge = error instanceof Error && error.name === "ResponseTooLargeError";
+      const isMemoryLimit = error instanceof Error && error.name === "WorkerMemoryLimitError";
       this.metrics.requestsTotal.inc({
         worker_id: input.workerId,
-        status: isEgress ? "403" : isConcurrency ? "429" : isResponseTooLarge ? "502" : "500",
+        status: isEgress ? "403" : isConcurrency || isMemoryLimit ? "429" : isResponseTooLarge ? "502" : "500",
       });
-      if (!isEgress && !isConcurrency && !isResponseTooLarge) {
+      if (!isEgress && !isConcurrency && !isMemoryLimit && !isResponseTooLarge) {
         this.metrics.errorsTotal.inc({ worker_id: input.workerId, type: "invoke" });
       }
       throw error;
     } finally {
       isolate.inFlight--;
+      isolate.reservedBytes = Math.max(0, isolate.reservedBytes - reservation);
     }
   }
 
-  private async readResponseBody(response: unknown): Promise<Uint8Array> {
+  private async readResponseBody(response: unknown, maxBytes: number): Promise<Uint8Array> {
     const bodyStream = (response as { body?: { getReader(): { read(): Promise<{ done: boolean; value?: Uint8Array; }>; cancel(): Promise<void>; releaseLock(): void; }; } | null }).body;
     if (!bodyStream) return new Uint8Array(0);
     const reader = bodyStream.getReader();
@@ -287,9 +313,9 @@ export class IsolateManager {
         const { done, value } = await reader.read();
         if (done || !value) break;
         total += value.byteLength;
-        if (total > this.deps.maxResponseBytes) {
+        if (total > maxBytes) {
           await reader.cancel();
-          throw new ResponseTooLargeError(this.deps.maxResponseBytes);
+          throw new ResponseTooLargeError(maxBytes);
         }
         chunks.push(value);
       }

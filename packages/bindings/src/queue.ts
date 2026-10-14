@@ -13,7 +13,7 @@ export class QueueBinding {
     private readonly workerId: string,
     private readonly name: string,
     private readonly redis: Redis,
-    private readonly options: { maxRetries?: number } = {},
+    private readonly options: { maxRetries?: number; retentionSeconds?: number } = {},
     private readonly hooks: { onSend?: (workerId: string) => void } = {}
   ) {}
 
@@ -39,6 +39,9 @@ export class QueueBinding {
       "attempts",
       "0"
     );
+    if (this.options.retentionSeconds) {
+      await this.redis.xtrim(this.streamKey(), "MINID", `${Date.now() - this.options.retentionSeconds * 1000}-0`);
+    }
     return { messageId: id ?? "" };
   }
 

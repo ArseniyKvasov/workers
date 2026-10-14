@@ -14,6 +14,7 @@ export interface BindingServiceOptions {
   libsql: LibSQLClient;
   /** Resolves the SQLite file path for a worker's D1 database (sync). */
   d1FilePath: (workerId: string, name: string) => string;
+  queueOptions?: Record<string, { maxRetries?: number }>;
   hooks?: {
     onRowsRead?: (workerId: string, rows: number) => void;
     onRowsWritten?: (workerId: string, rows: number) => void;
@@ -78,7 +79,7 @@ export function createBindingServices(workerId: string, options: BindingServiceO
     const cacheKey = `${workerId}:${name}`;
     let binding = queueBindings.get(cacheKey);
     if (!binding) {
-      binding = new QueueBinding(workerId, name, options.redis, {}, { onSend: hooks.onQueueSend });
+      binding = new QueueBinding(workerId, name, options.redis, options.queueOptions?.[name] ?? {}, { onSend: hooks.onQueueSend });
       queueBindings.set(cacheKey, binding);
     }
     return binding;

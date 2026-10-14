@@ -301,6 +301,9 @@ async function main() {
             kv_namespaces: bindingRows.filter((b) => b.bindingType === "kv").map((b) => b.bindingName),
             queues: bindingRows.filter((b) => b.bindingType === "queue").map((b) => b.bindingName),
           },
+          queueOptions: Object.fromEntries(bindingRows
+            .filter((b) => b.bindingType === "queue")
+            .map((b) => [b.bindingName, { maxRetries: Number(b.configJson.maxRetries ?? 3) }])),
           secrets,
           limits: {
             cpu_ms: (worker.limits.cpu_ms as number) ?? 5000,
