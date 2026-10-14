@@ -14,7 +14,7 @@ export interface BindingServiceOptions {
   libsql: LibSQLClient;
   /** Resolves the SQLite file path for a worker's D1 database (sync). */
   d1FilePath: (workerId: string, name: string) => string;
-  queueOptions?: Record<string, { maxRetries?: number }>;
+  queueOptions?: Record<string, { maxRetries?: number; retentionSeconds?: number; maxMessageBytes?: number; maxBatchSize?: number; maxMessages?: number }>;
   hooks?: {
     onRowsRead?: (workerId: string, rows: number) => void;
     onRowsWritten?: (workerId: string, rows: number) => void;

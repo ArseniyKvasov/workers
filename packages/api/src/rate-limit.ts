@@ -69,9 +69,14 @@ export class RateLimiter {
   }
 
   middleware(
-    getKey?: (c: Context) => string
+    getKey?: (c: Context) => string,
+    isExempt?: (c: Context) => boolean,
   ): (c: Context, next: Next) => Promise<Response | void> {
     return async (c, next) => {
+      if (isExempt?.(c)) {
+        await next();
+        return;
+      }
       const key =
         getKey?.(c) ??
         (c.get("apiKeyId") as string | undefined) ??

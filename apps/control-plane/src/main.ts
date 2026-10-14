@@ -52,8 +52,12 @@ function loadConfig(): AppConfig {
     secretsMasterKey: requireEnv("SECRETS_MASTER_KEY"),
     dataDir: process.env.DATA_DIR ?? "./data",
     port: Number(process.env.PORT ?? 3000),
-    rateLimitPerMinute: Number(process.env.API_RATE_LIMIT_PER_MINUTE ?? 600),
-    rateLimitBurst: Number(process.env.API_RATE_LIMIT_BURST ?? 100),
+    rateLimitPerMinute: Number(process.env.API_RATE_LIMIT_PER_MINUTE ?? 300),
+    rateLimitBurst: Number(process.env.API_RATE_LIMIT_BURST ?? 50),
+    rateLimitExemptIps: (process.env.RATE_LIMIT_EXEMPT_IPS ?? "")
+      .split(",")
+      .map((ip) => ip.trim())
+      .filter((ip) => ip.length > 0),
     // Empty means unrestricted access to public domains. Private/internal
     // destinations remain blocked by the runtime's SSRF protection.
     egressAllowedDomains: (process.env.EGRESS_ALLOWED_DOMAINS ?? "*")
@@ -70,8 +74,8 @@ function loadConfig(): AppConfig {
     maxResponseBytes: intEnv("MAX_RESPONSE_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
     maxBodyBytes: intEnv("MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
     /** Rate limiting for public worker ingress (per IP+worker). */
-    ingressRateLimitPerMinute: intEnv("INGRESS_RATE_LIMIT_PER_MINUTE", 300),
-    ingressRateLimitBurst: intEnv("INGRESS_RATE_LIMIT_BURST", 50),
+    ingressRateLimitPerMinute: intEnv("INGRESS_RATE_LIMIT_PER_MINUTE", 120),
+    ingressRateLimitBurst: intEnv("INGRESS_RATE_LIMIT_BURST", 30),
     trustedProxies: parseTrustedProxies(process.env.TRUSTED_PROXIES),
     corsAllowedOrigins: (process.env.CORS_ALLOWED_ORIGINS ?? "")
       .split(",")
@@ -303,7 +307,10 @@ async function main() {
           },
           queueOptions: Object.fromEntries(bindingRows
             .filter((b) => b.bindingType === "queue")
-            .map((b) => [b.bindingName, { maxRetries: Number(b.configJson.maxRetries ?? 3) }])),
+            .map((b) => [b.bindingName, {
+                          maxRetries: Number(b.configJson.maxRetries ?? 3),
+                          retentionSeconds: Number(b.configJson.retentionSeconds ?? 86400),
+                        }])),
           secrets,
           limits: {
             cpu_ms: (worker.limits.cpu_ms as number) ?? 5000,

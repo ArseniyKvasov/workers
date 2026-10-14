@@ -136,7 +136,7 @@ export class WorkersService {
     // manifests do not leave orphaned versions in the catalog.
     // Sync effective bindings for the runtime env
     const bindingRows: Array<{ bindingType: string; bindingName: string; configJson?: Record<string, unknown> }> = [];
-    const queueOptions: Record<string, { maxRetries: number }> = {};
+    const queueOptions: Record<string, { maxRetries: number; retentionSeconds: number }> = {};
     for (const name of manifest.bindings.d1_databases ?? []) {
       const db = await this.deps.d1Catalog.findByWorkerAndName(worker.id, name);
       if (!db) throw notFound(`D1 database "${name}" is not created for this worker`);
@@ -150,7 +150,7 @@ export class WorkersService {
     for (const name of manifest.bindings.queues ?? []) {
       const q = await this.deps.queuesCatalog.findByWorkerAndName(worker.id, name);
       if (!q) throw notFound(`queue "${name}" is not created for this worker`);
-      queueOptions[name] = { maxRetries: q.maxRetries };
+      queueOptions[name] = { maxRetries: q.maxRetries, retentionSeconds: q.retentionSeconds };
       bindingRows.push({ bindingType: "queue", bindingName: name, configJson: { maxRetries: q.maxRetries, retentionSeconds: q.retentionSeconds } });
     }
     const version = await this.deps.versions.create({
@@ -343,7 +343,10 @@ export class WorkersService {
     const queueNames = bindingRows.filter((b) => b.bindingType === "queue").map((b) => b.bindingName);
     const queueOptions = Object.fromEntries(bindingRows
       .filter((b) => b.bindingType === "queue")
-      .map((b) => [b.bindingName, { maxRetries: Number(b.configJson.maxRetries ?? 3) }]));
+      .map((b) => [b.bindingName, {
+              maxRetries: Number(b.configJson.maxRetries ?? 3),
+              retentionSeconds: Number(b.configJson.retentionSeconds ?? 86400),
+            }]));
 
     await this.deps.isolates.deploy({
       workerId,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { readBodyCapped } from "./body-limit.js";
-import { isTrustedProxy, parseTrustedProxies } from "./client-ip.js";
+import { isIpAllowedByList, isTrustedProxy, parseTrustedProxies } from "./client-ip.js";
 
 function makeRequest(body: string, headers: Record<string, string> = {}): Request {
   return new Request("http://localhost/test", { method: "POST", body, headers });
@@ -37,6 +37,14 @@ describe("parseTrustedProxies", () => {
       "10.0.0.0/8",
     ]);
     expect(parseTrustedProxies(undefined)).toEqual([]);
+  });
+});
+
+describe("isIpAllowedByList", () => {
+  it("matches exact IPs and IPv4 CIDRs", () => {
+    expect(isIpAllowedByList("203.0.113.10", ["203.0.113.10"])).toBe(true);
+    expect(isIpAllowedByList("10.20.30.40", ["10.0.0.0/8"])).toBe(true);
+    expect(isIpAllowedByList("192.168.1.1", ["10.0.0.0/8"])).toBe(false);
   });
 });
 

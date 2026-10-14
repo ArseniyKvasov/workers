@@ -8,12 +8,16 @@ import type { Redis } from "ioredis";
  * Stream key:  wp:{workerId}:queue:{name}
  * DLQ key:     wp:{workerId}:queue:{name}:dlq
  */
+const DEFAULT_MAX_MESSAGE_BYTES = 1024 * 1024;
+const DEFAULT_MAX_BATCH_SIZE = 100;
+const DEFAULT_MAX_MESSAGES = 100_000;
+
 export class QueueBinding {
   constructor(
     private readonly workerId: string,
     private readonly name: string,
     private readonly redis: Redis,
-    private readonly options: { maxRetries?: number; retentionSeconds?: number } = {},
+    private readonly options: { maxRetries?: number; retentionSeconds?: number; maxMessageBytes?: number; maxBatchSize?: number; maxMessages?: number } = {},
     private readonly hooks: { onSend?: (workerId: string) => void } = {}
   ) {}
 
@@ -30,6 +34,10 @@ export class QueueBinding {
   }
 
   async send(body: string): Promise<{ messageId: string }> {
+    const maxMessageBytes = this.options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES;
+    if (Buffer.byteLength(body) > maxMessageBytes) throw new Error(`queue message exceeds ${maxMessageBytes} bytes`);
+    const maxMessages = this.options.maxMessages ?? DEFAULT_MAX_MESSAGES;
+    if (await this.redis.xlen(this.streamKey()) >= maxMessages) throw new Error(`queue exceeds ${maxMessages} messages`);
     this.hooks.onSend?.(this.workerId);
     const id = await this.redis.xadd(
       this.streamKey(),
@@ -46,6 +54,8 @@ export class QueueBinding {
   }
 
   async batchSend(bodies: string[]): Promise<{ messageIds: string[] }> {
+    const maxBatchSize = this.options.maxBatchSize ?? DEFAULT_MAX_BATCH_SIZE;
+    if (bodies.length > maxBatchSize) throw new Error(`queue batch exceeds ${maxBatchSize} messages`);
     const ids: string[] = [];
     for (const body of bodies) {
       ids.push((await this.send(body)).messageId);

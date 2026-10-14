@@ -26,6 +26,22 @@ function ipv4ToInt(ip: string): number | null {
   return result;
 }
 
+export function isIpAllowedByList(ip: string, allowed: string[]): boolean {
+  const normalized = ip.replace(/^::ffff:/, "");
+  for (const entry of allowed) {
+    if (entry === ip || entry === normalized) return true;
+    const cidrMatch = /^(\d+\.\d+\.\d+\.\d+)\/(\d{1,2})$/.exec(entry);
+    if (!cidrMatch) continue;
+    const network = ipv4ToInt(cidrMatch[1]!);
+    const address = ipv4ToInt(normalized);
+    const bits = Number(cidrMatch[2]);
+    if (network === null || address === null || bits < 0 || bits > 32) continue;
+    const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+    if ((network & mask) === (address & mask)) return true;
+  }
+  return false;
+}
+
 export function isTrustedProxy(peer: string, trustedProxies: string[]): boolean {
   if (trustedProxies.length === 0) return false;
   // node reports IPv4-mapped IPv6 as ::ffff:a.b.c.d — normalize both ways.

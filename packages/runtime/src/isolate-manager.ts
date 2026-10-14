@@ -19,7 +19,7 @@ export interface IsolateDeployInput {
     kv_namespaces?: string[];
     queues?: string[];
   };
-  queueOptions?: Record<string, { maxRetries?: number }>;
+  queueOptions?: Record<string, { maxRetries?: number; retentionSeconds?: number; maxMessageBytes?: number; maxBatchSize?: number; maxMessages?: number }>;
   secrets: Record<string, string>;
   limits: { cpu_ms: number; memory_mb: number; concurrency: number };
   egress: EgressConfig;

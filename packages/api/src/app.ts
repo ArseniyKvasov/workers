@@ -15,7 +15,7 @@ import { AuthService, timingSafeEqualStr } from "./auth.js";
 import { RateLimiter } from "./rate-limit.js";
 import { HttpError } from "./errors.js";
 import { bodyLimitMiddleware, readBodyCapped } from "./body-limit.js";
-import { getClientIp } from "./client-ip.js";
+import { getClientIp, isIpAllowedByList } from "./client-ip.js";
 import { WorkersService } from "./services/workers-service.js";
 import { workersRoutes } from "./routes/workers.js";
 import { d1Routes, kvRoutes, queuesRoutes } from "./routes/resources.js";
@@ -46,6 +46,7 @@ export interface AppConfig {
   port: number;
   rateLimitPerMinute: number;
   rateLimitBurst: number;
+  rateLimitExemptIps: string[];
   egressAllowedDomains: string[];
   egressTimeoutMs: number;
   maxResponseBytes: number;
@@ -112,6 +113,8 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
     perMinute: deps.config.ingressRateLimitPerMinute,
     burst: deps.config.ingressRateLimitBurst,
   });
+  const isRateLimitExempt = (c: Context<AppVariables>) =>
+    isIpAllowedByList(getClientIp(c, deps.config.trustedProxies), deps.config.rateLimitExemptIps);
 
   const workersService = new WorkersService({
     workers: deps.repositories.workers,
@@ -186,8 +189,8 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
   // Rate limit the public ingress before any processing (per IP + worker).
   const ingressKey = (c: Context<AppVariables>) =>
     `${c.req.param("id") ?? "?"}:${getClientIp(c, deps.config.trustedProxies)}`;
-  app.use("/w/:id", ingressRateLimiter.middleware(ingressKey));
-  app.use("/w/:id/*", ingressRateLimiter.middleware(ingressKey));
+  app.use("/w/:id", ingressRateLimiter.middleware(ingressKey, isRateLimitExempt));
+  app.use("/w/:id/*", ingressRateLimiter.middleware(ingressKey, isRateLimitExempt));
 
   const forwardToWorker = async (c: Context<AppVariables>) => {
     const workerId = c.req.param("id");
@@ -355,7 +358,7 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
   app.use("/api/*", rateLimiter.middleware((c) => {
     const apiKeyId = c.get("apiKeyId") as string | undefined;
     return apiKeyId ?? getClientIp(c, deps.config.trustedProxies);
-  }));
+  }, isRateLimitExempt));
 
   // --- Audit wrapper for mutating requests ----------------------------------
   app.use("/api/*", async (c, next) => {
