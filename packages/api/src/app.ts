@@ -191,10 +191,18 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
 
   const forwardToWorker = async (c: Context<AppVariables>) => {
     const workerId = c.req.param("id");
-    const subpath = c.req.param("*") ?? "";
     if (!workerId || !UUID_RE.test(workerId)) {
       return c.json({ error: { code: "NOT_FOUND", message: "worker id is required" } }, 404);
     }
+
+    const incomingPath = new URL(c.req.raw.url).pathname;
+    const workerPrefix = `/w/${workerId}`;
+    const suffix = incomingPath === workerPrefix
+      ? ""
+      : incomingPath.startsWith(`${workerPrefix}/`)
+        ? incomingPath.slice(workerPrefix.length + 1)
+        : "";
+    const subpath = suffix;
 
     const query: Record<string, string> = {};
     try {
