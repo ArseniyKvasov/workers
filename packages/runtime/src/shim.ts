@@ -29,6 +29,7 @@ interface BindingsJson {
 /** Log entry structure for forwarding console logs */
 interface LogEntry {
   timestamp: string;
+  message?: string;
   level: "info" | "warn" | "error";
   method: string;
   path: string;
@@ -159,7 +160,42 @@ function parseJson(raw: unknown): Record<string, unknown> {
   }
 }
 
-function buildUserEnv(rawEnv: Record<string, unknown>): Record<string, unknown> {
+let globalConsoleInstalled = false;
+let activeConsoleSink: ((level: "info" | "warn" | "error", args: unknown[]) => void) | undefined;
+
+function installGlobalConsole(logsService: ServiceLike | undefined, workerId: string, waitUntil: (promise: Promise<unknown>) => void): void {
+  if (!logsService) return;
+  const nativeConsole = globalThis.console;
+  activeConsoleSink = (level, args) => {
+    const message = args.map(String).join(" ");
+    const entry: LogEntry = {
+      timestamp: new Date().toISOString(),
+      message,
+      level,
+      method: "LOG",
+      path: "/",
+      status: 0,
+      latencyMs: 0,
+      requestSize: 0,
+      responseSize: 0,
+      clientIp: "worker",
+      workerId,
+      error: level === "error" ? message : undefined,
+    };
+    waitUntil(callService(logsService, "logs", "logs.write", entry).catch(() => {}));
+  };
+  if (globalConsoleInstalled) return;
+  globalConsoleInstalled = true;
+  globalThis.console = {
+    ...nativeConsole,
+    log: (...args: unknown[]) => { nativeConsole.log(...args); activeConsoleSink?.("info", args); },
+    info: (...args: unknown[]) => { nativeConsole.info(...args); activeConsoleSink?.("info", args); },
+    warn: (...args: unknown[]) => { nativeConsole.warn(...args); activeConsoleSink?.("warn", args); },
+    error: (...args: unknown[]) => { nativeConsole.error(...args); activeConsoleSink?.("error", args); },
+  } as Console;
+}
+
+function buildUserEnv(rawEnv: Record<string, unknown>, waitUntil: (promise: Promise<unknown>) => void): Record<string, unknown> {
   const env: Record<string, unknown> = {};
   const bindings = parseJson(rawEnv["__BINDINGS"]) as BindingsJson;
 
@@ -188,70 +224,13 @@ function buildUserEnv(rawEnv: Record<string, unknown>): Record<string, unknown> 
     };
   }
 
-  // Override console.log/console.error to forward to LOGS
-  const originalLog = console.log;
-  const originalError = console.error;
   const workerId = rawEnv["__WORKER_ID"] as string | undefined ?? "unknown";
-
+  installGlobalConsole(logsService, workerId, waitUntil);
   env["console"] = {
-    log: (...args: unknown[]) => {
-      originalLog(...args);
-      const entry: LogEntry = {
-        timestamp: new Date().toISOString(),
-        level: "info",
-        method: "LOG",
-        path: "/",
-        status: 0,
-        latencyMs: 0,
-        requestSize: 0,
-        responseSize: 0,
-        clientIp: "worker",
-        workerId,
-        error: undefined,
-      };
-      // Fire and forget - don't await
-      if (logsService) {
-        callService(logsService, "logs", "logs.write", { ...entry, method: "LOG", path: args.map(String).join(" ") }).catch(() => {});
-      }
-    },
-    error: (...args: unknown[]) => {
-      originalError(...args);
-      const entry: LogEntry = {
-        timestamp: new Date().toISOString(),
-        level: "error",
-        method: "LOG",
-        path: "/",
-        status: 0,
-        latencyMs: 0,
-        requestSize: 0,
-        responseSize: 0,
-        clientIp: "worker",
-        workerId,
-        error: args.map(String).join(" "),
-      };
-      if (logsService) {
-        callService(logsService, "logs", "logs.write", { ...entry, method: "LOG", path: args.map(String).join(" ") }).catch(() => {});
-      }
-    },
-    warn: (...args: unknown[]) => {
-      console.warn(...args);
-      const entry: LogEntry = {
-        timestamp: new Date().toISOString(),
-        level: "warn",
-        method: "LOG",
-        path: "/",
-        status: 0,
-        latencyMs: 0,
-        requestSize: 0,
-        responseSize: 0,
-        clientIp: "worker",
-        workerId,
-        error: undefined,
-      };
-      if (logsService) {
-        callService(logsService, "logs", "logs.write", { ...entry, method: "LOG", path: args.map(String).join(" ") }).catch(() => {});
-      }
-    },
+    log: (...args: unknown[]) => activeConsoleSink?.("info", args),
+    info: (...args: unknown[]) => activeConsoleSink?.("info", args),
+    warn: (...args: unknown[]) => activeConsoleSink?.("warn", args),
+    error: (...args: unknown[]) => activeConsoleSink?.("error", args),
   };
 
   return env;
@@ -263,7 +242,7 @@ export default {
     rawEnv: Record<string, unknown>,
     ctx: { waitUntil(promise: Promise<unknown>): void }
   ): Promise<Response> {
-    const userEnv = buildUserEnv(rawEnv);
+    const userEnv = buildUserEnv(rawEnv, (promise) => ctx.waitUntil(promise));
     return user.fetch(request, userEnv, ctx);
   },
 };

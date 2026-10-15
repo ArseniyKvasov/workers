@@ -392,13 +392,7 @@ export class WorkersService {
     }
     const latencyMs = Date.now() - startedAt;
 
-    await this.deps.usage.recordSample(workerId, {
-      requestsCount: 1,
-      errorsCount: result.status >= 500 ? 1 : 0,
-      cpuMsTotal: result.metrics.cpuMs,
-    });
-
-    // Write request log
+    // Write request log before usage accounting so a database outage cannot hide access logs.
     await this.writeLog({
       timestamp: new Date().toISOString(),
       level: result.status >= 500 ? "error" : result.status >= 400 ? "warn" : "info",
@@ -410,8 +404,15 @@ export class WorkersService {
       responseSize: result.bodyText?.length ?? 0,
       clientIp: "api-invoke",
       workerId,
+      message: `${input.method} ${input.path} ${result.status} ${result.status < 400 ? "OK" : "ERROR"}`,
       error: result.status >= 500 ? `HTTP ${result.status}` : undefined,
     });
+
+    await this.deps.usage.recordSample(workerId, {
+      requestsCount: 1,
+      errorsCount: result.status >= 500 ? 1 : 0,
+      cpuMsTotal: result.metrics.cpuMs,
+    }).catch((error) => console.error("[usage] record failed:", error));
 
     // JSON API returns UTF-8 text (binary responses are not representable here).
     return { ...result, body: result.bodyText };
@@ -459,13 +460,7 @@ export class WorkersService {
     }
     const latencyMs = Date.now() - startedAt;
 
-    await this.deps.usage.recordSample(workerId, {
-      requestsCount: 1,
-      errorsCount: result.status >= 500 ? 1 : 0,
-      cpuMsTotal: result.metrics.cpuMs,
-    });
-
-    // Write request log
+    // Write request log before usage accounting so a database outage cannot hide access logs.
     await this.writeLog({
       timestamp: new Date().toISOString(),
       level: result.status >= 500 ? "error" : result.status >= 400 ? "warn" : "info",
@@ -477,8 +472,15 @@ export class WorkersService {
       responseSize: result.body instanceof Uint8Array ? result.body.byteLength : (result.bodyText?.length ?? 0),
       clientIp: "ingress",
       workerId,
+      message: `${input.method} ${input.path} ${result.status} ${result.status < 400 ? "OK" : "ERROR"}`,
       error: result.status >= 500 ? `HTTP ${result.status}` : undefined,
     });
+
+    await this.deps.usage.recordSample(workerId, {
+      requestsCount: 1,
+      errorsCount: result.status >= 500 ? 1 : 0,
+      cpuMsTotal: result.metrics.cpuMs,
+    }).catch((error) => console.error("[usage] record failed:", error));
 
     return { workerId, status: result.status, body: result.body, headers: result.headers };
   }

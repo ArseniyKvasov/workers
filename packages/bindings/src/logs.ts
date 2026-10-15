@@ -13,6 +13,8 @@ export interface LogEntry {
   timestamp: string;
   /** Log level: info | warn | error */
   level: "info" | "warn" | "error";
+  /** Human-readable access/console line, e.g. "GET /health 200 OK". */
+  message?: string;
   /** HTTP method */
   method: string;
   /** Request path */
@@ -224,6 +226,7 @@ export class LogBinding {
       sanitized.error = LogBinding.redactString(sanitized.error).slice(0, 500);
     }
     sanitized.path = LogBinding.redactString(sanitized.path).slice(0, 2000);
+    if (sanitized.message) sanitized.message = LogBinding.redactString(sanitized.message).slice(0, 4000);
 
     return sanitized;
   }
