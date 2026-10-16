@@ -123,10 +123,27 @@ export class WorkersService {
     const parsedManifest = manifestSchema.safeParse(input.manifest ?? {});
     if (!parsedManifest.success) throw new HttpError(400, "VALIDATION_ERROR", "invalid worker manifest", parsedManifest.error.issues);
     const manifest = parsedManifest.data;
+    const declaredBindings = input.manifest?.bindings;
+    const existingD1 = declaredBindings?.d1_databases === undefined
+      ? (await this.deps.d1Catalog.listByWorker(worker.id)).map((db) => db.name)
+      : [];
+    const existingKv = declaredBindings?.kv_namespaces === undefined
+      ? (await this.deps.kvCatalog.listByWorker(worker.id)).map((namespace) => namespace.name)
+      : [];
+    const existingQueues = declaredBindings?.queues === undefined
+      ? (await this.deps.queuesCatalog.listByWorker(worker.id)).map((queue) => queue.name)
+      : [];
+    const effectiveBindings = {
+      d1_databases: declaredBindings?.d1_databases ?? existingD1,
+      kv_namespaces: declaredBindings?.kv_namespaces ?? existingKv,
+      queues: declaredBindings?.queues ?? existingQueues,
+      secrets: manifest.bindings.secrets,
+    };
+    const effectiveManifest = { ...manifest, bindings: effectiveBindings };
     const allBindingNames = [
-      ...manifest.bindings.d1_databases,
-      ...manifest.bindings.kv_namespaces,
-      ...manifest.bindings.queues,
+      ...effectiveBindings.d1_databases,
+      ...effectiveBindings.kv_namespaces,
+      ...effectiveBindings.queues,
     ];
     if (new Set(allBindingNames).size !== allBindingNames.length) {
       throw new HttpError(400, "VALIDATION_ERROR", "binding names must be unique across types");
@@ -137,17 +154,17 @@ export class WorkersService {
     // Sync effective bindings for the runtime env
     const bindingRows: Array<{ bindingType: string; bindingName: string; configJson?: Record<string, unknown> }> = [];
     const queueOptions: Record<string, { maxRetries: number; retentionSeconds: number }> = {};
-    for (const name of manifest.bindings.d1_databases ?? []) {
+    for (const name of effectiveBindings.d1_databases) {
       const db = await this.deps.d1Catalog.findByWorkerAndName(worker.id, name);
       if (!db) throw notFound(`D1 database "${name}" is not created for this worker`);
       bindingRows.push({ bindingType: "d1", bindingName: name, configJson: { filePath: db.filePath } });
     }
-    for (const name of manifest.bindings.kv_namespaces ?? []) {
+    for (const name of effectiveBindings.kv_namespaces) {
       const ns = await this.deps.kvCatalog.findByWorkerAndName(worker.id, name);
       if (!ns) throw notFound(`KV namespace "${name}" is not created for this worker`);
       bindingRows.push({ bindingType: "kv", bindingName: name });
     }
-    for (const name of manifest.bindings.queues ?? []) {
+    for (const name of effectiveBindings.queues) {
       const q = await this.deps.queuesCatalog.findByWorkerAndName(worker.id, name);
       if (!q) throw notFound(`queue "${name}" is not created for this worker`);
       queueOptions[name] = { maxRetries: q.maxRetries, retentionSeconds: q.retentionSeconds };
@@ -158,7 +175,7 @@ export class WorkersService {
       codeHash,
       bundleSize: input.code.byteLength,
       code,
-      manifest: manifest as unknown as Record<string, unknown>,
+      manifest: effectiveManifest as unknown as Record<string, unknown>,
     });
     const previousPromoted = await this.deps.versions.findPromoted(worker.id);
     const previousBindings = await this.deps.bindingsRepo.listForWorker(worker.id);
@@ -184,9 +201,9 @@ export class WorkersService {
       versionId: version.id,
       code,
       bindings: {
-        d1_databases: manifest.bindings.d1_databases ?? [],
-        kv_namespaces: manifest.bindings.kv_namespaces ?? [],
-        queues: manifest.bindings.queues ?? [],
+        d1_databases: effectiveBindings.d1_databases,
+        kv_namespaces: effectiveBindings.kv_namespaces,
+        queues: effectiveBindings.queues,
         secrets: manifest.bindings.secrets ?? [],
       },
       queueOptions,
