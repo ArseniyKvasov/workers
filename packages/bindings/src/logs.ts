@@ -103,12 +103,12 @@ export class LogBinding {
     const sanitized = this.sanitize(entry);
     const id = await this.redis.xadd(
       this.streamKey,
-      "*",
-      "data",
-      JSON.stringify(sanitized),
       "MAXLEN",
       "~",
-      String(this.maxLen)
+      String(this.maxLen),
+      "*",
+      "data",
+      JSON.stringify(sanitized)
     );
     return id ?? "";
   }

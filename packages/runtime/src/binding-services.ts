@@ -203,6 +203,7 @@ export function createBindingServices(workerId: string, options: BindingServiceO
             responseSize: (p.responseSize as number) ?? 0,
             clientIp: (p.clientIp as string) ?? "worker",
             workerId,
+            message: p.message as string | undefined,
             error: p.error as string | undefined,
             traceId: p.traceId as string | undefined,
           };
