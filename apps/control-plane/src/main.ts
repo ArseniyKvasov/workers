@@ -302,15 +302,15 @@ async function main() {
         secrets?: string[];
       } };
       const manifestBindings = promotedManifest.bindings ?? {};
-      const d1BindingNames = manifestBindings.d1_databases?.length
-        ? manifestBindings.d1_databases
-        : bindingRows.filter((b) => b.bindingType === "d1").map((b) => b.bindingName);
-      const kvBindingNames = manifestBindings.kv_namespaces?.length
-        ? manifestBindings.kv_namespaces
-        : bindingRows.filter((b) => b.bindingType === "kv").map((b) => b.bindingName);
-      const queueBindingNames = manifestBindings.queues?.length
-        ? manifestBindings.queues
-        : bindingRows.filter((b) => b.bindingType === "queue").map((b) => b.bindingName);
+      const d1BindingNames = manifestBindings.d1_databases === undefined
+        ? bindingRows.filter((b) => b.bindingType === "d1").map((b) => b.bindingName)
+        : manifestBindings.d1_databases;
+      const kvBindingNames = manifestBindings.kv_namespaces === undefined
+        ? bindingRows.filter((b) => b.bindingType === "kv").map((b) => b.bindingName)
+        : manifestBindings.kv_namespaces;
+      const queueBindingNames = manifestBindings.queues === undefined
+        ? bindingRows.filter((b) => b.bindingType === "queue").map((b) => b.bindingName)
+        : manifestBindings.queues;
       try {
         await isolates.deploy({
           workerId: worker.id,

@@ -355,10 +355,17 @@ export class WorkersService {
       if (envelope) secrets[name] = this.deps.secretCrypto.decrypt(workerId, envelope);
     }
 
-    const d1Names = manifest.bindings.d1_databases ?? [];
-    const kvNames = manifest.bindings.kv_namespaces ?? [];
-    const queueNames = manifest.bindings.queues ?? [];
     const queueRows = await this.deps.bindingsRepo.listForWorker(workerId);
+    const manifestBindings = manifest.bindings ?? {};
+    const d1Names = manifestBindings.d1_databases === undefined
+      ? queueRows.filter((b) => b.bindingType === "d1").map((b) => b.bindingName)
+      : manifestBindings.d1_databases;
+    const kvNames = manifestBindings.kv_namespaces === undefined
+      ? queueRows.filter((b) => b.bindingType === "kv").map((b) => b.bindingName)
+      : manifestBindings.kv_namespaces;
+    const queueNames = manifestBindings.queues === undefined
+      ? queueRows.filter((b) => b.bindingType === "queue").map((b) => b.bindingName)
+      : manifestBindings.queues;
     const queueOptions = Object.fromEntries(queueRows
       .filter((b) => b.bindingType === "queue" && queueNames.includes(b.bindingName))
       .map((b) => [b.bindingName, {
@@ -374,7 +381,7 @@ export class WorkersService {
         d1_databases: d1Names,
         kv_namespaces: kvNames,
         queues: queueNames,
-        secrets: manifest.bindings.secrets ?? [],
+        secrets: manifestBindings.secrets ?? [],
       },
       queueOptions,
       secrets,
