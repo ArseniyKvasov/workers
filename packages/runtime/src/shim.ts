@@ -161,6 +161,19 @@ function parseJson(raw: unknown): Record<string, unknown> {
   }
 }
 
+/**
+ * Resource names predate Cloudflare-style binding names in this API. Keep the
+ * declared name available and expose the conventional uppercase form so
+ * existing manifests such as `lms_db` also work with `env.LMS_DB`.
+ */
+function exposeBinding(env: Record<string, unknown>, name: string, value: unknown): void {
+  env[name] = value;
+  const uppercaseName = name.toUpperCase();
+  if (uppercaseName !== name && !Object.prototype.hasOwnProperty.call(env, uppercaseName)) {
+    env[uppercaseName] = value;
+  }
+}
+
 let globalConsoleInstalled = false;
 let activeConsoleSink: ((level: "info" | "warn" | "error", args: unknown[]) => void) | undefined;
 
@@ -201,13 +214,13 @@ function buildUserEnv(rawEnv: Record<string, unknown>, waitUntil: (promise: Prom
   const bindings = parseJson(rawEnv["__BINDINGS"]) as BindingsJson;
 
   for (const name of bindings.d1_databases ?? []) {
-    env[name] = createD1Client(rawEnv["__D1"] as ServiceLike, name);
+    exposeBinding(env, name, createD1Client(rawEnv["__D1"] as ServiceLike, name));
   }
   for (const name of bindings.kv_namespaces ?? []) {
-    env[name] = createKVClient(rawEnv["__KV"] as ServiceLike, name);
+    exposeBinding(env, name, createKVClient(rawEnv["__KV"] as ServiceLike, name));
   }
   for (const name of bindings.queues ?? []) {
-    env[name] = createQueueClient(rawEnv["__QUEUE"] as ServiceLike, name);
+    exposeBinding(env, name, createQueueClient(rawEnv["__QUEUE"] as ServiceLike, name));
   }
 
   const secretValues = parseJson(rawEnv["__SECRETS"]) as Record<string, string>;
