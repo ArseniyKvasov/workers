@@ -18,6 +18,7 @@ export interface IsolateDeployInput {
     d1_databases?: string[];
     kv_namespaces?: string[];
     queues?: string[];
+    secrets?: string[];
   };
   queueOptions?: Record<string, { maxRetries?: number; retentionSeconds?: number; maxMessageBytes?: number; maxBatchSize?: number; maxMessages?: number }>;
   secrets: Record<string, string>;
@@ -191,6 +192,7 @@ export class IsolateManager {
           script: shimBundle.code,
           bindings: {
             __SECRETS: JSON.stringify(input.secrets),
+            __SECRET_BINDINGS: JSON.stringify(input.bindings.secrets ?? []),
             __BINDINGS: JSON.stringify(input.bindings),
             __WORKER_ID: input.workerId,
           },

@@ -24,6 +24,7 @@ interface BindingsJson {
   d1_databases?: string[];
   kv_namespaces?: string[];
   queues?: string[];
+  secrets?: string[];
 }
 
 /** Log entry structure for forwarding console logs */
@@ -210,6 +211,11 @@ function buildUserEnv(rawEnv: Record<string, unknown>, waitUntil: (promise: Prom
   }
 
   const secretValues = parseJson(rawEnv["__SECRETS"]) as Record<string, string>;
+  const declaredSecretNames = bindings.secrets ?? [];
+  const secretNames = declaredSecretNames.length > 0 ? declaredSecretNames : Object.keys(secretValues);
+  for (const name of secretNames) {
+    if (Object.prototype.hasOwnProperty.call(secretValues, name)) env[name] = secretValues[name];
+  }
   env["SECRETS"] = {
     get: (name: string): string | null => secretValues[name] ?? null,
   };

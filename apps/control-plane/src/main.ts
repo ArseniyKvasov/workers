@@ -295,18 +295,35 @@ async function main() {
       }
 
       const bindingRows = await repositories.bindings.listForWorker(worker.id);
+      const promotedManifest = promoted.manifest as { bindings?: {
+        d1_databases?: string[];
+        kv_namespaces?: string[];
+        queues?: string[];
+        secrets?: string[];
+      } };
+      const manifestBindings = promotedManifest.bindings ?? {};
+      const d1BindingNames = manifestBindings.d1_databases?.length
+        ? manifestBindings.d1_databases
+        : bindingRows.filter((b) => b.bindingType === "d1").map((b) => b.bindingName);
+      const kvBindingNames = manifestBindings.kv_namespaces?.length
+        ? manifestBindings.kv_namespaces
+        : bindingRows.filter((b) => b.bindingType === "kv").map((b) => b.bindingName);
+      const queueBindingNames = manifestBindings.queues?.length
+        ? manifestBindings.queues
+        : bindingRows.filter((b) => b.bindingType === "queue").map((b) => b.bindingName);
       try {
         await isolates.deploy({
           workerId: worker.id,
           versionId: promoted.id,
           code: promoted.code,
           bindings: {
-            d1_databases: bindingRows.filter((b) => b.bindingType === "d1").map((b) => b.bindingName),
-            kv_namespaces: bindingRows.filter((b) => b.bindingType === "kv").map((b) => b.bindingName),
-            queues: bindingRows.filter((b) => b.bindingType === "queue").map((b) => b.bindingName),
+            d1_databases: d1BindingNames,
+            kv_namespaces: kvBindingNames,
+            queues: queueBindingNames,
+            secrets: manifestBindings.secrets ?? [],
           },
           queueOptions: Object.fromEntries(bindingRows
-            .filter((b) => b.bindingType === "queue")
+            .filter((b) => b.bindingType === "queue" && queueBindingNames.includes(b.bindingName))
             .map((b) => [b.bindingName, {
                           maxRetries: Number(b.configJson.maxRetries ?? 3),
                           retentionSeconds: Number(b.configJson.retentionSeconds ?? 86400),

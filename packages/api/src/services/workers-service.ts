@@ -187,6 +187,7 @@ export class WorkersService {
         d1_databases: manifest.bindings.d1_databases ?? [],
         kv_namespaces: manifest.bindings.kv_namespaces ?? [],
         queues: manifest.bindings.queues ?? [],
+        secrets: manifest.bindings.secrets ?? [],
       },
       queueOptions,
       secrets,
@@ -337,22 +338,27 @@ export class WorkersService {
       if (envelope) secrets[name] = this.deps.secretCrypto.decrypt(workerId, envelope);
     }
 
-    const bindingRows = await this.deps.bindingsRepo.listForWorker(workerId);
-    const d1Names = bindingRows.filter((b) => b.bindingType === "d1").map((b) => b.bindingName);
-    const kvNames = bindingRows.filter((b) => b.bindingType === "kv").map((b) => b.bindingName);
-    const queueNames = bindingRows.filter((b) => b.bindingType === "queue").map((b) => b.bindingName);
-    const queueOptions = Object.fromEntries(bindingRows
-      .filter((b) => b.bindingType === "queue")
+    const d1Names = manifest.bindings.d1_databases ?? [];
+    const kvNames = manifest.bindings.kv_namespaces ?? [];
+    const queueNames = manifest.bindings.queues ?? [];
+    const queueRows = await this.deps.bindingsRepo.listForWorker(workerId);
+    const queueOptions = Object.fromEntries(queueRows
+      .filter((b) => b.bindingType === "queue" && queueNames.includes(b.bindingName))
       .map((b) => [b.bindingName, {
-              maxRetries: Number(b.configJson.maxRetries ?? 3),
-              retentionSeconds: Number(b.configJson.retentionSeconds ?? 86400),
-            }]));
+        maxRetries: Number(b.configJson.maxRetries ?? 3),
+        retentionSeconds: Number(b.configJson.retentionSeconds ?? 86400),
+      }]));
 
     await this.deps.isolates.deploy({
       workerId,
       versionId: version.id,
       code: version.code,
-      bindings: { d1_databases: d1Names, kv_namespaces: kvNames, queues: queueNames },
+      bindings: {
+        d1_databases: d1Names,
+        kv_namespaces: kvNames,
+        queues: queueNames,
+        secrets: manifest.bindings.secrets ?? [],
+      },
       queueOptions,
       secrets,
       limits: {

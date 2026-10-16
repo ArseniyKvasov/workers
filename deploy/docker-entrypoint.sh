@@ -63,7 +63,7 @@ if [ -z "${SECRETS_MASTER_KEY:-}" ]; then
     echo "[entrypoint] WARN: SECRETS_MASTER_KEY is not set (not required for utility command: $1)" >&2
   fi
 fi
-if [ -z "${API_KEY:-}" ]; then
+if [ "$_running_server" -eq 1 ] && [ -z "${API_KEY:-}" ]; then
   echo "[entrypoint] WARN: API_KEY is not set — every /api/* request will 401" >&2
 fi
 
