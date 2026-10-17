@@ -77,11 +77,8 @@ Environment:
                               (default: sudo nginx -s reload)
    NGINX_TEST_CMD              config test command (default: sudo nginx -t)
    SITE_URL                    canonical site URL; its hostname becomes DOMAIN
-   CERTBOT_EMAIL               email for automatic wildcard certificate issuance
-   CERTBOT_DNS_PLUGIN          certbot DNS plugin name, e.g. cloudflare
-   CERTBOT_DNS_CREDENTIALS     credentials file for the DNS plugin
-   TLS_CERT_FILE / TLS_KEY_FILE  TLS cert paths (default: letsencrypt live dir
-                               for $DOMAIN; missing certs are issued automatically)
+   TLS_CERT_FILE / TLS_KEY_FILE  TLS cert paths (default: let's encrypt live dir
+                               for $DOMAIN; must be provisioned manually)
   PUBLIC_HEALTH_URL           probe through nginx after switch
                               (default: http://127.0.0.1/health)
   HEALTH_TIMEOUT              seconds to wait for the new slot (default: 180)
@@ -773,28 +770,14 @@ wait_healthy() {
 ensure_tls_certificate() {
   local cert="${TLS_CERT_FILE:-/etc/letsencrypt/live/${DOMAIN}/fullchain.pem}"
   local key="${TLS_KEY_FILE:-/etc/letsencrypt/live/${DOMAIN}/privkey.pem}"
-
   if [[ -f "$cert" && -f "$key" ]]; then
     log "TLS certificate found for ${DOMAIN}"
     return 0
   fi
   if [[ -n "${TLS_CERT_FILE:-}" || -n "${TLS_KEY_FILE:-}" ]]; then
-    die "TLS certificate is missing (${cert} / ${key}); either set default paths or manually provision TLS_CERT_FILE/TLS_KEY_FILE"
+    die "TLS certificate missing (${cert} / ${key}); manually provision TLS_CERT_FILE/TLS_KEY_FILE or set the default Let's Encrypt paths"
   fi
-  command -v certbot >/dev/null 2>&1 || die "TLS certificate is missing and certbot is not installed"
-  [[ -n "${CERTBOT_EMAIL:-}" ]] || die "CERTBOT_EMAIL must be set for automatic wildcard certificate issuance"
-  [[ -n "${CERTBOT_DNS_PLUGIN:-}" ]] || die "CERTBOT_DNS_PLUGIN must be set (e.g. cloudflare) for wildcard certificate"
-  [[ -r "${CERTBOT_DNS_CREDENTIALS:-}" ]] || die "Certbot DNS credentials file is not readable: ${CERTBOT_DNS_CREDENTIALS}"
-
-  log "TLS certificate missing; issuing wildcard certificate for ${DOMAIN} and *.${DOMAIN}"
-  certbot certonly --non-interactive --agree-tos \
-    --email "$CERTBOT_EMAIL" \
-    --cert-name "$DOMAIN" \
-    --dns-${CERTBOT_DNS_PLUGIN} --dns-${CERTBOT_DNS_PLUGIN}-credentials "$CERTBOT_DNS_CREDENTIALS" \
-    -d "$DOMAIN" -d "*.${DOMAIN}"
-
-  [[ -f "$cert" && -f "$key" ]] || die "certbot completed but certificate files not found at ${cert} / ${key}"
-  log "TLS wildcard certificate issued for ${DOMAIN}"
+  die "TLS certificate missing (${cert} / ${key}); provision certificate manually or set TLS_CERT_FILE/TLS_KEY_FILE"
 }
 
 probe_public() {

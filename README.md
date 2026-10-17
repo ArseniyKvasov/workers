@@ -238,9 +238,6 @@ Auth: `Authorization: Bearer wpk_...` для всех `/api/*`. Открытые
 | `API_KEY` | Static ключ для management API | `wpk_` + `openssl rand -hex 16` |
 | `SITE_URL` | Канонический URL; hostname становится `DOMAIN` и базой wildcard | `https://workers.fastclass.ru` |
 | `DOMAIN` | Публичный домен (fallback, если `SITE_URL` не задан) | `workers.fastclass.ru` |
-| `CERTBOT_EMAIL` | Email для Let's Encrypt | `admin@example.com` |
-| `CERTBOT_DNS_PLUGIN` | DNS-плагин Certbot для wildcard-сертификата | `cloudflare` |
-| `CERTBOT_DNS_CREDENTIALS` | Файл credentials DNS-плагина | `/etc/letsencrypt/cloudflare.ini` |
 | `S3_BACKUP_BUCKET` | S3 бакет для бэкапов | `my-backups` |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | AWS credentials для S3 бэкапов | |
 | `S3_ENDPOINT` | Для S3-совместимых (MinIO, Selectel, Yandex) | `https://s3.example.com` |
@@ -251,14 +248,7 @@ Auth: `Authorization: Bearer wpk_...` для всех `/api/*`. Открытые
 | `NGINX_HTTP_PORT` / `NGINX_HTTPS_PORT` | Nginx порты | `8080` / `8443` |
 | `EGRESS_ALLOWED_DOMAINS` | Куда воркеры могут ходить (fetch) | `api.moodle.org,*.instructure.com` |
 
-**TLS / wildcard-сертификаты:** при отсутствии сертификата (`TLS_CERT_FILE`/`TLS_KEY_FILE`) `production.sh` автоматически выпускает wildcard (`DOMAIN` + `*.DOMAIN`) через Certbot DNS-плагин. Для этого на хосте деплоя должны быть установлены `certbot` + выбранный плагин (`CERTBOT_DNS_PLUGIN`), а файл `CERTBOT_DNS_CREDENTIALS` — доступен для чтения.
-
-```bash
-# Пример для Cloudflare (перед деплоем установите: apt install certbot python3-certbot-dns-cloudflare)
-CERTBOT_DNS_PLUGIN=cloudflare
-CERTBOT_DNS_CREDENTIALS=/etc/letsencrypt/cloudflare.ini
-CERTBOT_EMAIL=admin@example.com
-```
+**TLS:** сертификат (`TLS_CERT_FILE`/`TLS_KEY_FILE`) должен быть предоставлен заранее. При его отсутствии deploy прервётся с ошибкой.
 
 ### Команды деплоя
 
