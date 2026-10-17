@@ -47,7 +47,7 @@ export class WorkersRepository {
     const rows = await this.db
       .select()
       .from(workers)
-      .where(and(sql`${workers.id} LIKE ${`%${suffix}`}`, sql`${workers.status} <> 'deleted'`))
+      .where(and(sql`${workers.id}::text LIKE ${`%${suffix}`}`, sql`${workers.status} <> 'deleted'`))
       .limit(2);
     if (rows.length !== 1) return undefined;
     return rows[0] as WorkerRow;
