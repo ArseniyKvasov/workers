@@ -186,13 +186,13 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
   });
 
   // --- Public worker ingress (rate-limited by IP): invoke by worker subdomain --
-  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const PUBLIC_SUFFIX_RE = /^[0-9a-f]{6}$/i;
   const workerHostSuffix = `.${deps.config.domain.toLowerCase()}`;
   const workerIdFromHost = (host: string | undefined): string | undefined => {
     const hostname = ((host ?? "").split(":", 1)[0] ?? "").toLowerCase();
     if (!hostname.endsWith(workerHostSuffix)) return undefined;
-    const workerId = hostname.slice(0, -workerHostSuffix.length);
-    return UUID_RE.test(workerId) ? workerId : undefined;
+    const suffix = hostname.slice(0, -workerHostSuffix.length);
+    return PUBLIC_SUFFIX_RE.test(suffix) ? suffix : undefined;
   };
 
   // Rate limit the public ingress before any processing (per IP + worker).
@@ -204,10 +204,13 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
   });
 
   const forwardToWorker = async (c: Context<AppVariables>) => {
-    const workerId = workerIdFromHost(c.req.header("host"));
-    if (!workerId) {
+    const workerSuffix = workerIdFromHost(c.req.header("host"));
+    if (!workerSuffix) {
       return c.json({ error: { code: "NOT_FOUND", message: "worker id is required" } }, 404);
     }
+    const worker = await deps.repositories.workers.findActiveByPublicSuffix(workerSuffix);
+    if (!worker) return c.json({ error: { code: "NOT_FOUND", message: "worker not found" } }, 404);
+    const workerId = worker.id;
 
     const incomingPath = new URL(c.req.raw.url).pathname;
     const subpath = incomingPath.slice(1);

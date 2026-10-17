@@ -4,7 +4,7 @@ info:
   version: 1.0.0
   description: |
     Self-hosted workers platform. Management endpoints (`/api/*`) require `Authorization: Bearer <API_KEY>`.
-    Public worker ingress (`https://<uuid>.workers.fastclass.ru/*`) requires no auth; workers are addressed by their UUID subdomain.
+    Public worker ingress (`https://<uuid-last-6>.workers.fastclass.ru/*`) requires no auth; workers are addressed by the last 6 UUID characters.
     Domain configured via `.env` (`DOMAIN`).
 servers:
   - url: https://workers.fastclass.ru
@@ -271,23 +271,23 @@ paths:
   /:
     get:
       tags: [public-ingress]
-      summary: Public worker entrypoint (GET); UUID is the subdomain
+      summary: Public worker entrypoint (GET); last 6 UUID characters are the subdomain
       parameters:
         - name: Host
           in: header
           required: true
-          schema: { type: string, example: a1b2c3d4-e5f6-47a8-9012-abcdef123456.workers.fastclass.ru }
+          schema: { type: string, example: 123456.workers.fastclass.ru }
       responses:
         '200':
           description: Worker response
     post:
       tags: [public-ingress]
-      summary: Public worker entrypoint (POST); UUID is the subdomain
+      summary: Public worker entrypoint (POST); last 6 UUID characters are the subdomain
       parameters:
         - name: Host
           in: header
           required: true
-          schema: { type: string, example: a1b2c3d4-e5f6-47a8-9012-abcdef123456.workers.fastclass.ru }
+          schema: { type: string, example: 123456.workers.fastclass.ru }
       requestBody:
         required: false
         content:

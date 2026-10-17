@@ -21,7 +21,7 @@ function serializeWorker(w: {
     limits: w.limits,
     created_at: w.createdAt.toISOString(),
     updated_at: w.updatedAt.toISOString(),
-    public_url: `https://${w.id}.${domain}`,
+    public_url: `https://${w.id.slice(-6)}.${domain}`,
   };
 }
 

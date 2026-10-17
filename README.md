@@ -79,8 +79,8 @@ console.log('API_KEY:', key);
 curl http://localhost:8080/health
 curl http://localhost:8080/ready
 
-# Публичный ingress воркера (без auth, через nginx на 8080; адрес — UUID воркера)
-curl -X POST https://<worker-uuid>.workers.fastclass.ru -d '{"action":"test"}'
+# Публичный ingress воркера (без auth, через nginx; адрес — последние 6 символов UUID)
+curl -X POST https://<uuid-last-6>.workers.fastclass.ru -d '{"action":"test"}'
 
 # Management API (требует API_KEY из .env)
 curl -H "Authorization: Bearer $API_KEY" http://localhost:8080/api/workers
@@ -164,11 +164,11 @@ curl -s "http://localhost:3000/api/workers/$WORKER/invoke" -X POST \
 
 ## API
 
-**Workers публичны**: любой может вызвать воркер через `https://<uuid>.workers.fastclass.ru` — любой метод, путь,
+**Workers публичны**: любой может вызвать воркер через `https://<uuid-last-6>.workers.fastclass.ru` — любой метод, путь,
 query и тело форвардятся в изолят напрямую:
 
 ```bash
-curl -s "https://$WORKER.workers.fastclass.ru?since=1" -X POST -d '{"action":"sync"}'
+curl -s "https://$WORKER_LAST_6.workers.fastclass.ru?since=1" -X POST -d '{"action":"sync"}'
 ```
 
 **Management API** (`/api/*` — деплой, секреты, D1, KV, логи и т.д.) — только с API-ключом:
@@ -176,11 +176,11 @@ curl -s "https://$WORKER.workers.fastclass.ru?since=1" -X POST -d '{"action":"sy
 - **DB-ключи** через `POST /api/api-keys` (показывается один раз)
 
 Auth: `Authorization: Bearer wpk_...` для всех `/api/*`. Открытые без auth:
-`<uuid>.workers.fastclass.ru`, `/health`, `/ready`, `/metrics`, `/version`.
+`<uuid-last-6>.workers.fastclass.ru`, `/health`, `/ready`, `/metrics`, `/version`.
 
 | Метод | Путь | Описание |
 |-------|------|----------|
-| ANY | `https://<uuid>.workers.fastclass.ru/*` | **Публичный ingress к воркеру по UUID** (без auth; путь/query/body форвардятся) |
+| ANY | `https://<uuid-last-6>.workers.fastclass.ru/*` | **Публичный ingress к воркеру по последним 6 символам UUID** (без auth; путь/query/body форвардятся) |
 | POST | `/api/workers` | Создать воркер (лимиты; UUID генерируется автоматически) — auth |
 | GET | `/api/workers` | Список (limit/offset) |
 | GET/PATCH/DELETE | `/api/workers/:id` | Детали / обновить / удалить |

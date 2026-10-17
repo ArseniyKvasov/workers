@@ -4,7 +4,7 @@ info:
   version: 1.0.0
   description: |
     Self-hosted workers platform. Management endpoints (`/api/*`) require `Authorization: Bearer <API_KEY>`.
-    Public worker ingress (`https://<uuid>.workers.fastclass.ru/*`) requires no auth; workers are addressed by their UUID subdomain.
+    Public worker ingress (`https://<uuid-last-6>.workers.fastclass.ru/*`) requires no auth; workers are addressed by the last 6 UUID characters.
     Domain configured via `.env` (`DOMAIN`).
 servers:
   - url: https://workers.fastclass.ru

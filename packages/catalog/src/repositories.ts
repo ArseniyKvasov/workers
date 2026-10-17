@@ -43,6 +43,16 @@ export class WorkersRepository {
     return rows[0] as WorkerRow | undefined;
   }
 
+  async findActiveByPublicSuffix(suffix: string): Promise<WorkerRow | undefined> {
+    const rows = await this.db
+      .select()
+      .from(workers)
+      .where(and(sql`${workers.id} LIKE ${`%${suffix}`}`, sql`${workers.status} <> 'deleted'`))
+      .limit(2);
+    if (rows.length !== 1) return undefined;
+    return rows[0] as WorkerRow;
+  }
+
   async listActive(limit: number, offset: number): Promise<WorkerRow[]> {
     const rows = await this.db
       .select()
