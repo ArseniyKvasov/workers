@@ -23,7 +23,7 @@
 #
 # What this script deliberately does NOT do ("does not manage all of nginx"):
 #   - it never touches /etc/nginx/nginx.conf or any other site;
-#   - it never installs/enables/disables sites, never runs certbot;
+#   - it never installs/enables/disables sites;
 #   - it never starts, stops or *restarts* nginx (restart drops connections).
 #   It only rewrites ONE file ($NGINX_CONFIG_PATH) and runs ONE graceful
 #   reload command (overridable via $NGINX_RELOAD_CMD, skippable via
@@ -75,9 +75,13 @@ Environment:
                               (default: /etc/nginx/sites-available/workers-platform.conf)
   NGINX_RELOAD_CMD            graceful reload command
                               (default: sudo nginx -s reload)
-  NGINX_TEST_CMD              config test command (default: sudo nginx -t)
-  TLS_CERT_FILE / TLS_KEY_FILE  TLS cert paths (default: letsencrypt live dir
-                              for $DOMAIN; 443 block added only if both exist)
+   NGINX_TEST_CMD              config test command (default: sudo nginx -t)
+   SITE_URL                    canonical site URL; its hostname becomes DOMAIN
+   CERTBOT_EMAIL               email for automatic wildcard certificate issuance
+   CERTBOT_DNS_PLUGIN          certbot DNS plugin name, e.g. cloudflare
+   CERTBOT_DNS_CREDENTIALS     credentials file for the DNS plugin
+   TLS_CERT_FILE / TLS_KEY_FILE  TLS cert paths (default: letsencrypt live dir
+                               for $DOMAIN; missing certs are issued automatically)
   PUBLIC_HEALTH_URL           probe through nginx after switch
                               (default: http://127.0.0.1/health)
   HEALTH_TIMEOUT              seconds to wait for the new slot (default: 180)
@@ -105,6 +109,20 @@ load_env() {
   # shellcheck disable=SC1090
   source "$tmp_env"
   set +a
+  if [[ -n "${SITE_URL:-}" ]]; then
+    DOMAIN="$(site_url_domain "$SITE_URL")" || die "invalid SITE_URL: $SITE_URL"
+  fi
+}
+
+site_url_domain() {
+  local url="$1"
+  SITE_URL_VALUE="$url" node -e '
+    try {
+      const parsed = new URL(process.env.SITE_URL_VALUE);
+      if (!/^https?:$/.test(parsed.protocol) || parsed.pathname !== "/" || parsed.search || parsed.hash || parsed.username || parsed.password) process.exit(1);
+      process.stdout.write(parsed.hostname);
+    } catch { process.exit(1); }
+  '
 }
 
 require_env() {
@@ -752,6 +770,33 @@ wait_healthy() {
   return 1
 }
 
+ensure_tls_certificate() {
+  local cert="${TLS_CERT_FILE:-/etc/letsencrypt/live/${DOMAIN}/fullchain.pem}"
+  local key="${TLS_KEY_FILE:-/etc/letsencrypt/live/${DOMAIN}/privkey.pem}"
+
+  if [[ -f "$cert" && -f "$key" ]]; then
+    log "TLS certificate found for ${DOMAIN}"
+    return 0
+  fi
+  if [[ -n "${TLS_CERT_FILE:-}" || -n "${TLS_KEY_FILE:-}" ]]; then
+    die "TLS certificate is missing (${cert} / ${key}); either set default paths or manually provision TLS_CERT_FILE/TLS_KEY_FILE"
+  fi
+  command -v certbot >/dev/null 2>&1 || die "TLS certificate is missing and certbot is not installed"
+  [[ -n "${CERTBOT_EMAIL:-}" ]] || die "CERTBOT_EMAIL must be set for automatic wildcard certificate issuance"
+  [[ -n "${CERTBOT_DNS_PLUGIN:-}" ]] || die "CERTBOT_DNS_PLUGIN must be set (e.g. cloudflare) for wildcard certificate"
+  [[ -r "${CERTBOT_DNS_CREDENTIALS:-}" ]] || die "Certbot DNS credentials file is not readable: ${CERTBOT_DNS_CREDENTIALS}"
+
+  log "TLS certificate missing; issuing wildcard certificate for ${DOMAIN} and *.${DOMAIN}"
+  certbot certonly --non-interactive --agree-tos \
+    --email "$CERTBOT_EMAIL" \
+    --cert-name "$DOMAIN" \
+    --dns-${CERTBOT_DNS_PLUGIN} --dns-${CERTBOT_DNS_PLUGIN}-credentials "$CERTBOT_DNS_CREDENTIALS" \
+    -d "$DOMAIN" -d "*.${DOMAIN}"
+
+  [[ -f "$cert" && -f "$key" ]] || die "certbot completed but certificate files not found at ${cert} / ${key}"
+  log "TLS wildcard certificate issued for ${DOMAIN}"
+}
+
 probe_public() {
   local url="${PUBLIC_HEALTH_URL:-http://127.0.0.1/health}"
   if curl -fsS -m 10 -H "Host: ${DOMAIN}" "$url" >/dev/null 2>&1; then
@@ -768,6 +813,7 @@ cmd_deploy() {
   local incoming_image="${1:-}"
 
   preflight
+  ensure_tls_certificate
   ensure_database
   do_backup
 
