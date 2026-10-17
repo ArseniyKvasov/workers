@@ -82,6 +82,7 @@ function loadConfig(): AppConfig {
       .map((o) => o.trim())
       .filter((o) => o.length > 0),
     metricsToken: process.env.METRICS_TOKEN || undefined,
+    domain: process.env.DOMAIN ?? "workers.fastclass.ru",
   };
 }
 

@@ -63,6 +63,8 @@ export interface AppConfig {
   corsAllowedOrigins: string[];
   /** When set, /metrics requires this bearer token. */
   metricsToken?: string;
+  /** Base domain used for public worker subdomains. */
+  domain: string;
 }
 
 export interface AppRepositories {
@@ -183,29 +185,32 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
     );
   });
 
-  // --- Public worker ingress (rate-limited by IP): invoke a worker by id -------
+  // --- Public worker ingress (rate-limited by IP): invoke by worker subdomain --
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const workerHostSuffix = `.${deps.config.domain.toLowerCase()}`;
+  const workerIdFromHost = (host: string | undefined): string | undefined => {
+    const hostname = ((host ?? "").split(":", 1)[0] ?? "").toLowerCase();
+    if (!hostname.endsWith(workerHostSuffix)) return undefined;
+    const workerId = hostname.slice(0, -workerHostSuffix.length);
+    return UUID_RE.test(workerId) ? workerId : undefined;
+  };
 
   // Rate limit the public ingress before any processing (per IP + worker).
   const ingressKey = (c: Context<AppVariables>) =>
-    `${c.req.param("id") ?? "?"}:${getClientIp(c, deps.config.trustedProxies)}`;
-  app.use("/w/:id", ingressRateLimiter.middleware(ingressKey, isRateLimitExempt));
-  app.use("/w/:id/*", ingressRateLimiter.middleware(ingressKey, isRateLimitExempt));
+    `${workerIdFromHost(c.req.header("host")) ?? "?"}:${getClientIp(c, deps.config.trustedProxies)}`;
+  app.use("*", async (c, next) => {
+    if (!workerIdFromHost(c.req.header("host"))) return next();
+    return ingressRateLimiter.middleware(ingressKey, isRateLimitExempt)(c, next);
+  });
 
   const forwardToWorker = async (c: Context<AppVariables>) => {
-    const workerId = c.req.param("id");
-    if (!workerId || !UUID_RE.test(workerId)) {
+    const workerId = workerIdFromHost(c.req.header("host"));
+    if (!workerId) {
       return c.json({ error: { code: "NOT_FOUND", message: "worker id is required" } }, 404);
     }
 
     const incomingPath = new URL(c.req.raw.url).pathname;
-    const workerPrefix = `/w/${workerId}`;
-    const suffix = incomingPath === workerPrefix
-      ? ""
-      : incomingPath.startsWith(`${workerPrefix}/`)
-        ? incomingPath.slice(workerPrefix.length + 1)
-        : "";
-    const subpath = suffix;
+    const subpath = incomingPath.slice(1);
 
     const query: Record<string, string> = {};
     try {
@@ -244,8 +249,7 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
     return c.body(responseBody, result.status as 200);
   };
 
-  app.all("/w/:id", forwardToWorker);
-  app.all("/w/:id/*", forwardToWorker);
+  app.all("*", (c, next) => workerIdFromHost(c.req.header("host")) ? forwardToWorker(c) : next());
 
   // --- Public endpoints (no auth) -------------------------------------------
   // /live — liveness: процесс запущен и отвечает. Всегда 200 пока жив.
@@ -386,7 +390,7 @@ export function buildApp(deps: AppDeps): Hono<AppVariables> {
   // --- API routes -------------------------------------------------------------
   const api = new Hono();
   const logs = new LogBinding("system", deps.redis, { maxLen: 100_000 });
-  api.route("/", workersRoutes({ workersService, maxBodyBytes: deps.config.maxBodyBytes, redis: deps.redis, logs }));
+  api.route("/", workersRoutes({ workersService, maxBodyBytes: deps.config.maxBodyBytes, redis: deps.redis, logs, domain: deps.config.domain }));
   api.route("/", d1Routes({ workersService, d1Catalog: deps.repositories.d1Catalog }));
   api.route("/", kvRoutes({ workersService, kvCatalog: deps.repositories.kvCatalog, redis: deps.redis }));
   api.route("/", queuesRoutes({ workersService, queuesCatalog: deps.repositories.queuesCatalog, redis: deps.redis }));

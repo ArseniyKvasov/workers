@@ -13,7 +13,7 @@ function serializeWorker(w: {
   limits: unknown;
   createdAt: Date;
   updatedAt: Date;
-}) {
+}, domain: string) {
   return {
     id: w.id,
     runtime: w.runtime,
@@ -21,10 +21,11 @@ function serializeWorker(w: {
     limits: w.limits,
     created_at: w.createdAt.toISOString(),
     updated_at: w.updatedAt.toISOString(),
+    public_url: `https://${w.id}.${domain}`,
   };
 }
 
-export function workersRoutes(deps: { workersService: WorkersService; maxBodyBytes: number; redis: Redis; logs: LogBinding }): Hono {
+export function workersRoutes(deps: { workersService: WorkersService; maxBodyBytes: number; redis: Redis; logs: LogBinding; domain: string }): Hono {
   const app = new Hono();
 
   // --- Workers CRUD -------------------------------------------------------
@@ -33,7 +34,7 @@ export function workersRoutes(deps: { workersService: WorkersService; maxBodyByt
     if (!parsed.success) throw badRequest("invalid worker payload", parsed.error.issues);
 
     const worker = await deps.workersService.createWorker(parsed.data);
-    return c.json({ data: serializeWorker(worker) }, 201);
+    return c.json({ data: serializeWorker(worker, deps.domain) }, 201);
   });
 
   app.get("/workers", async (c) => {
@@ -46,21 +47,21 @@ export function workersRoutes(deps: { workersService: WorkersService; maxBodyByt
     const offset = requestedOffset;
     const { items, total } = await deps.workersService.listWorkers(limit, offset);
     return c.json({
-      data: items.map(serializeWorker),
+      data: items.map((worker) => serializeWorker(worker, deps.domain)),
       meta: { total, limit, offset },
     });
   });
 
   app.get("/workers/:id", async (c) => {
     const worker = await deps.workersService.getWorker(c.req.param("id"));
-    return c.json({ data: serializeWorker(worker) });
+    return c.json({ data: serializeWorker(worker, deps.domain) });
   });
 
   app.patch("/workers/:id", async (c) => {
     const parsed = workerUpdateSchema.safeParse(await c.req.json());
     if (!parsed.success) throw badRequest("invalid worker update", parsed.error.issues);
     const updated = await deps.workersService.updateWorker(c.req.param("id"), parsed.data as Record<string, unknown>);
-    return c.json({ data: updated ? serializeWorker(updated) : null });
+    return c.json({ data: updated ? serializeWorker(updated, deps.domain) : null });
   });
 
   app.delete("/workers/:id", async (c) => {

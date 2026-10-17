@@ -15,7 +15,7 @@ upstream workers_platform_app {
 
 server {
     listen 80;
-    server_name __DOMAIN__;
+    server_name __DOMAIN__ *.__DOMAIN__;
 
     location ^~ /.well-known/acme-challenge/ {
         root /var/www/certbot;
